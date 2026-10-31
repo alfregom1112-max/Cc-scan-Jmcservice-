@@ -62,6 +62,8 @@ export default function EventosScreen() {
   const { user } = useSession();
   const { selectEvento, clearEvento, eventoId, totalRegistros, wsStatus, queueSize } = useEvento();
   const isAdmin = user?.role === "admin";
+  const connectionColor = wsStatus === "online" ? theme.success : wsStatus === "connecting" ? theme.warning : theme.error;
+  const connectionLabel = wsStatus === "online" ? "Conectado" : wsStatus === "connecting" ? "Conectando" : "Sin conexión";
   const membershipActive = user?.subscription_status === "internal" ||
     ((user?.subscription_status === "active" || user?.subscription_status === "trial") &&
       !!user.current_period_ends_at && Date.parse(user.current_period_ends_at) > Date.now());
@@ -131,10 +133,11 @@ export default function EventosScreen() {
             <Text style={styles.brandWord}>JM ServiceTec</Text>
             <TouchableOpacity style={styles.profileShortcut} onPress={() => router.push("/(app)/perfil" as any)} accessibilityLabel="Mi perfil"><Ionicons name="person-outline" size={22} color={theme.text} /></TouchableOpacity>
           </View>
+          <View style={{ gap: 5, marginBottom: 8 }}><Text style={{ color: theme.text, fontSize: 27, fontWeight: "800" }}>Hola, {user?.nombre?.split(" ")[0] || "bienvenido"}</Text><Text style={{ color: theme.brand, fontSize: 13, fontWeight: "700" }}>Operador · {user?.tenant_name || "Tu empresa"}</Text></View>
           <View style={styles.connectedCard}>
-            <View style={styles.connectedDot} />
-            <View style={{ flex: 1 }}><Text style={styles.connectedText}>{wsStatus === "online" ? "Conectado" : wsStatus === "connecting" ? "Conectando" : "Sin conexión"}</Text><Text style={styles.connectedMeta}>{queueSize ? `${queueSize} registros por sincronizar` : "Sincronizando en tiempo real"}</Text></View>
-            <Ionicons name={wsStatus === "online" ? "wifi" : "cloud-offline-outline"} size={20} color={wsStatus === "online" ? theme.success : theme.warning} />
+            <View style={[styles.connectedDot, { backgroundColor: connectionColor }]} />
+            <View style={{ flex: 1 }}><Text style={styles.connectedText}>{connectionLabel}</Text><Text style={styles.connectedMeta}>{queueSize ? `${queueSize} registros por sincronizar` : wsStatus === "online" ? "Sincronizando en tiempo real" : wsStatus === "connecting" ? "Conectando con el servidor" : "Los escaneos se guardan en este dispositivo"}</Text></View>
+            <Ionicons name={wsStatus === "online" ? "wifi" : "cloud-offline-outline"} size={20} color={connectionColor} />
           </View>
           <Text style={styles.eventSectionTitle}>Evento actual</Text>
           <TouchableOpacity style={styles.eventHero} activeOpacity={0.88} onPress={() => clearEvento()}>
@@ -147,9 +150,9 @@ export default function EventosScreen() {
           </TouchableOpacity>
           {!membershipActive && <View style={styles.subscriptionNotice}><Ionicons name="alert-circle-outline" size={18} color={theme.warning} /><Text style={styles.subscriptionNoticeText}>La membresía de esta empresa no está activa. Los escaneos se habilitan al activar o renovar el plan.</Text></View>}
           <TouchableOpacity activeOpacity={0.9} disabled={!membershipActive} onPress={() => membershipActive ? router.push("/(app)/escanear") : undefined} style={!membershipActive ? { opacity: 0.45 } : undefined}>
-            <LinearGradient colors={["#06BFA5", "#079AA5"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.scanHero}>
+            <LinearGradient colors={["#0867E8", "#0754CD"]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={styles.scanHero}>
               <Ionicons name="scan-outline" size={54} color="#fff" />
-              <Text style={styles.scanHeroTitle}>Empezar a escanear</Text>
+              <Text style={styles.scanHeroTitle}>Iniciar escaneo</Text>
             </LinearGradient>
           </TouchableOpacity>
           <View style={styles.homeCount}><Ionicons name="checkmark-circle" size={17} color={theme.success} /><Text style={styles.homeCountText}>{totalRegistros} registros en este evento</Text></View>
@@ -170,8 +173,8 @@ export default function EventosScreen() {
     <SafeAreaView style={styles.container} edges={["top", "left", "right"]}>
       <View style={styles.header}>
         <View>
-          <Text style={styles.eyebrow}>OPERACIONES</Text>
-          <Text style={styles.title}>Tus eventos</Text>
+          <Text style={styles.eyebrow}>{isAdmin ? "ADMINISTRACIÓN" : "OPERACIONES"}</Text>
+          <Text style={styles.title}>{isAdmin ? "Eventos de la empresa" : "Eventos asignados"}</Text>
           <Text style={styles.subtitle}>Selecciona un operativo para activar el escáner</Text>
         </View>
         {isAdmin && membershipActive && <TouchableOpacity
@@ -326,8 +329,8 @@ const styles = StyleSheet.create({
   operatorHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginBottom: 2 },
   brandWord: { color: theme.text, fontSize: 23, fontWeight: "900", letterSpacing: -0.6 },
   profileShortcut: { width: 40, height: 40, borderRadius: 14, alignItems: "center", justifyContent: "center", backgroundColor: theme.surface, borderColor: theme.border, borderWidth: 1 },
-  connectedCard: { flexDirection: "row", alignItems: "center", gap: 11, backgroundColor: "#EAF8FA", borderRadius: 14, paddingHorizontal: 14, paddingVertical: 13 },
-  connectedDot: { width: 13, height: 13, borderRadius: 7, backgroundColor: theme.success },
+  connectedCard: { flexDirection: "row", alignItems: "center", gap: 11, backgroundColor: "#EEF5FF", borderRadius: 14, paddingHorizontal: 14, paddingVertical: 13 },
+  connectedDot: { width: 11, height: 11, borderRadius: 6 },
   connectedText: { color: theme.text, fontSize: 12, fontWeight: "900" },
   connectedMeta: { color: theme.textSecondary, fontSize: 11, marginTop: 2 },
   eventSectionTitle: { color: theme.text, fontSize: 13, fontWeight: "900", marginBottom: -8 },
