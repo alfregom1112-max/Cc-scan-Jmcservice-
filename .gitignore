@@ -1,0 +1,21 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+node_modules/
+.DS_Store
+*.log
+
+# Expo and native build output
+frontend/.expo/
+frontend/.metro-cache/
+frontend/dist/
+frontend/android/.gradle/
+frontend/android/app/build/
+frontend/android/app/.cxx/
+frontend/ios/Pods/
+
+# generated tenant-web config
+tenant-web/dist/config.js
+backend/.npm-cache/

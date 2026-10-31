@@ -1,0 +1,78 @@
+{
+  "expo": {
+    "name": "JM ServiceTec Eventos",
+    "slug": "jm-servicetec-eventos",
+    "version": "3.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/images/icon.png",
+    "scheme": "jmservicetec",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Permitir usar la cámara para escanear cédulas."
+      }
+    },
+    "android": {
+      "allowBackup": false,
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/images/adaptive-icon.png",
+        "backgroundColor": "#14324A"
+      },
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_SCAN"
+      ],
+      "package": "com.jmservicetec.eventos",
+      "versionCode": 1
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "static",
+      "favicon": "./assets/images/favicon.png"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/images/splash-image.png",
+          "imageWidth": 240,
+          "resizeMode": "contain",
+          "backgroundColor": "#14324A"
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Escanear códigos de barras de cédulas",
+          "recordAudioAndroid": false
+        }
+      ],
+      "expo-font",
+      "expo-image",
+      [
+        "expo-sqlite",
+        {
+          "useSQLCipher": true
+        }
+      ],
+      "expo-secure-store",
+      "expo-sharing",
+      "expo-status-bar",
+      "expo-web-browser"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "extra": {
+      "router": {},
+      "backendUrl": ""
+    }
+  }
+}

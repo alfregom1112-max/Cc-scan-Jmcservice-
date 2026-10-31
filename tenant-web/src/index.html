@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <title>JM ServiceTec | Empresas y membresías</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/config.js"></script>
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="brand"><div class="brand-mark">JM</div><div><strong>JM ServiceTec</strong><span>Operación de eventos</span></div></header>
+      <section id="login" class="card login-card">
+        <p class="eyebrow">Acceso interno</p><h1>Administrar membresías</h1>
+        <p class="muted">Ingresa con la cuenta de administración de plataforma.</p>
+        <form id="login-form" class="stack">
+          <label>Correo<input id="login-email" type="email" autocomplete="username" required /></label>
+          <label>Contraseña<input id="login-password" type="password" autocomplete="current-password" required /></label>
+          <button class="primary" type="submit">Ingresar</button>
+        </form>
+        <p id="login-message" class="message" role="status"></p>
+      </section>
+
+      <section id="app" hidden>
+        <header class="page-head"><div><p class="eyebrow">Panel de plataforma</p><h1>Empresas y membresías</h1><p class="muted">Crea cuentas para clientes y administra periodos de servicio.</p></div><button id="logout" class="secondary">Cerrar sesión</button></header>
+        <div id="access-denied" class="notice" hidden>Esta cuenta no tiene permisos de administración de plataforma.</div>
+        <div id="workspace" class="workspace" hidden>
+          <section class="card"><div class="section-head"><div><p class="eyebrow">Nueva empresa</p><h2>Crear tenant</h2></div></div>
+            <form id="tenant-form" class="stack">
+              <label>Nombre de la empresa<input id="tenant-name" maxlength="120" required /></label>
+              <label>Correo del administrador<input id="owner-email" type="email" maxlength="254" required /></label>
+              <div class="columns"><label>Periodicidad<select id="billing-period"><option value="monthly">Mensual</option><option value="annual">Anual</option></select></label><label>Precio (COP)<input id="price-cop" type="number" min="0" step="1000" placeholder="Opcional" /></label></div>
+              <button class="primary" type="submit">Crear empresa y generar PIN</button>
+              <p class="hint">El PIN se muestra una sola vez. Confirma el pago antes de activar la membresía; este panel no realiza cobros.</p>
+            </form><p id="tenant-message" class="message" role="status"></p>
+          </section>
+          <section class="card"><div class="section-head"><div><p class="eyebrow">Cartera</p><h2>Empresas registradas</h2></div><button id="refresh" class="secondary">Actualizar</button></div><div id="tenant-list" class="tenant-list"></div></section>
+        </div>
+      </section>
+      <footer>JM ServiceTec · Los datos de asistencia no se muestran en este panel.</footer>
+    </main>
+    <dialog id="pin-dialog"><div class="dialog-head"><div><p class="eyebrow">Entrega segura</p><h2>PIN de activación</h2></div><button id="close-pin" class="icon-button" aria-label="Cerrar">×</button></div><p>Comparte este código únicamente con el administrador de la empresa por un canal seguro. Vence en 30 minutos.</p><div id="pin-value" class="pin"></div><button id="copy-pin" class="primary">Copiar PIN</button></dialog>
+  </body>
+</html>

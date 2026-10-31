@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: jm-servicetec-api
+    runtime: docker
+    repo: https://github.com/alfregom1112-max/Cc-scan-Jmcservice-
+    branch: main
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /v1/health
+    plan: free
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_URL
+        value: https://sjmjgfimnwvepghoqjgh.supabase.co
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB_NAME
+        value: jm_servicetec_events
+      - key: CORS_ORIGINS
+        sync: false
+      - key: SCAN_DATA_ENCRYPTION_KEY
+        sync: false
+      - key: SCAN_LOOKUP_HMAC_KEY
+        sync: false
+      - key: MAX_SCAN_BATCH_SIZE
+        value: "100"
+      - key: SCAN_RATE_LIMIT_PER_MINUTE
+        value: "600"

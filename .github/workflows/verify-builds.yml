@@ -1,0 +1,35 @@
+name: Verify deployment packages
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-and-tenant-portal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            backend/package-lock.json
+            tenant-web/package-lock.json
+      - name: Install backend dependencies
+        run: npm ci --prefix backend
+      - name: Check backend JavaScript syntax
+        run: |
+          node --check backend/src/server.js
+          node --check backend/src/scanCrypto.js
+          node --check backend/scripts/migrate-supabase-scans-to-atlas.mjs
+      - name: Install tenant portal dependencies
+        run: npm ci --prefix tenant-web
+      - name: Build static tenant portal
+        env:
+          SUPABASE_URL: https://example.supabase.co
+          SUPABASE_PUBLISHABLE_KEY: sb_publishable_example
+        run: npm run build --prefix tenant-web

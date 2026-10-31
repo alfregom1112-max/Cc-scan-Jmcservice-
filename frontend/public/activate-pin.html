@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Activar cuenta · CedulaScan</title>
+  <style>
+    body{margin:0;background:#f3f7fb;color:#102a43;font:16px system-ui;display:grid;place-items:center;min-height:100vh}
+    .card{box-sizing:border-box;width:min(460px,calc(100% - 32px));background:#fff;border:1px solid #d8e2ec;border-radius:24px;padding:28px;box-shadow:0 18px 50px #102a4318}
+    h1{margin:8px 0}.muted{color:#60748a;line-height:1.5}
+    label{display:block;font-size:12px;font-weight:800;margin-top:18px;letter-spacing:.04em;text-transform:uppercase}
+    input{box-sizing:border-box;width:100%;padding:14px;border:1px solid #cbd8e6;border-radius:12px;font-size:17px;margin-top:7px;color:#102a43}
+    button{width:100%;border:0;background:#0f7f78;color:white;border-radius:12px;padding:15px;font-weight:800;font-size:16px;margin-top:22px}
+    #message{margin-top:16px;line-height:1.45}.ok{color:#087f5b}.err{color:#b42318}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div style="font-weight:900;letter-spacing:2px;color:#0f7f78">CEDULASCAN</div>
+    <h1>Activa tu cuenta</h1>
+    <p class="muted">Escribe tu nombre, el PIN que te entregó el administrador y crea tu contraseña.</p>
+    <form id="form">
+      <label for="fullName">Nombre completo</label>
+      <input id="fullName" autocomplete="name" maxlength="120" required placeholder="Escribe tu nombre y apellido">
+      <label for="pin">PIN de activación</label>
+      <input id="pin" inputmode="numeric" maxlength="6" required placeholder="000000">
+      <label for="email">Correo de acceso</label>
+      <input id="email" type="email" autocomplete="email" required placeholder="operador@ejemplo.com">
+      <label for="password">Nueva contraseña</label>
+      <input id="password" type="password" minlength="8" autocomplete="new-password" required placeholder="Mínimo 8 caracteres">
+      <label for="confirm">Repite la contraseña</label>
+      <input id="confirm" type="password" minlength="8" autocomplete="new-password" required>
+      <button id="submit">Activar cuenta</button>
+    </form>
+    <p id="message" role="status" aria-live="polite"></p>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    const URL="https://jpgutodasjltatrotgdq.supabase.co";
+    const KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJvbGUiOiJhbm9uIiwiaWF0IjoxNzkyMTQzOTc1LCJleHAiOjIxMDc3MTk5NzV9.X4M6366FB_Thsw9Z92wC6USATKQ4OtnC3o0nhxEy16o";
+    const sb=window.supabase.createClient(URL,KEY),form=document.getElementById('form'),msg=document.getElementById('message'),submit=document.getElementById('submit');
+    form.addEventListener('submit',async e=>{
+      e.preventDefault();msg.className='';msg.textContent='Activando cuenta...';submit.disabled=true;
+      const full_name=document.getElementById('fullName').value.trim();
+      const pin=document.getElementById('pin').value.replace(/\D/g,'');
+      const email=document.getElementById('email').value.trim().toLowerCase();
+      const password=document.getElementById('password').value;
+      const confirm=document.getElementById('confirm').value;
+      if(!full_name){msg.className='err';msg.textContent='Escribe tu nombre completo.';submit.disabled=false;return}
+      if(password!==confirm){msg.className='err';msg.textContent='Las contraseñas no coinciden.';submit.disabled=false;return}
+      try{
+        const {data,error}=await sb.functions.invoke('activate-user-pin',{body:{full_name,email,pin,password}});
+        if(error||data?.error)throw new Error(data?.error||error?.message||'No se pudo activar la cuenta.');
+        msg.className='ok';msg.textContent='Cuenta activada. Ya puedes entrar en CedulaScan con tu correo y contraseña.';form.reset();
+      }catch(error){msg.className='err';msg.textContent=error?.message||'No se pudo activar la cuenta.'}
+      finally{submit.disabled=false}
+    });
+  </script>
+</body>
+</html>
