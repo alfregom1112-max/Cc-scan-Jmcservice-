@@ -1,6 +1,14 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type" };
+const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type", "Access-Control-Allow-Methods": "POST, OPTIONS" };
+
+// Orígenes del portal permitidos para los enlaces (secret PORTAL_ORIGINS="https://portal.ejemplo.com,https://otro.netlify.app").
+const allowedOrigins = (Deno.env.get("PORTAL_ORIGINS") || "https://coruscating-truffle-13663a.netlify.app").split(",").map((v) => v.trim()).filter(Boolean);
+const FALLBACK_REDIRECT = Deno.env.get("DEFAULT_PORTAL_URL") || "https://coruscating-truffle-13663a.netlify.app/";
+function safeRedirect(value: unknown): string {
+  try { const u = new URL(String(value || "")); if (allowedOrigins.includes(u.origin)) return u.origin + u.pathname; } catch { /* usa el valor por defecto */ }
+  return FALLBACK_REDIRECT;
+}
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
@@ -17,6 +25,7 @@ Deno.serve(async (req) => {
     if (!profile || profile.role !== "admin" || profile.status !== "active") throw new Error("Solo un administrador activo puede reenviar invitaciones");
     const body = await req.json();
     const email = String(body.email || "").trim().toLowerCase();
+    const redirectTo = safeRedirect(body.redirect_to);
     if (!email || !email.includes("@")) throw new Error("Correo inválido");
     const admin = createClient(url, service);
     let found: any = null;
@@ -31,7 +40,7 @@ Deno.serve(async (req) => {
     if (!targetProfile || targetProfile.tenant_id !== profile.tenant_id) throw new Error("No puedes reenviar invitaciones de otra empresa");
     if (found.email_confirmed_at) {
       const { error: recoveryError } = await admin.auth.resetPasswordForEmail(email, {
-        redirectTo: "https://jmservicetec.com/accept-invite.html",
+        redirectTo,
       });
       if (recoveryError) throw recoveryError;
       return new Response(JSON.stringify({ ok: true, email, mode: "recovery" }), { headers: { ...cors, "Content-Type": "application/json" } });
@@ -40,7 +49,7 @@ Deno.serve(async (req) => {
     await admin.auth.admin.deleteUser(found.id);
     const { data: invited, error: inviteError } = await admin.auth.admin.inviteUserByEmail(email, {
       data: { full_name: profileData?.full_name || found.user_metadata?.full_name || "" },
-      redirectTo: "https://jmservicetec.com/accept-invite.html",
+      redirectTo,
     });
     if (inviteError) throw inviteError;
     if (invited.user) {

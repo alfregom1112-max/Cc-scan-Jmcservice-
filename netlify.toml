@@ -3,6 +3,11 @@
   command = "npm run build"
   publish = "dist"
 
+[build.environment]
+  # La URL y la publishable key son credenciales públicas del cliente Supabase.
+  # Excluir solo estos nombres evita el falso positivo del escáner de Netlify.
+  SECRETS_SCAN_OMIT_KEYS = "SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY"
+
 [[headers]]
   for = "/*"
   [headers.values]

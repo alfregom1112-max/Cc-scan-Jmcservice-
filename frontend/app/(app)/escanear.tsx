@@ -1,1024 +1,59 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  View,
-  Text,
-  TouchableOpacity,
-  StyleSheet,
-  TextInput,
-  Alert,
-  KeyboardAvoidingView,
-  Platform,
-  ScrollView,
-  FlatList,
-  Animated,
-  ActivityIndicator,
-  AppState,
-} from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
-import { useFocusEffect, useRouter } from "expo-router";
-import { Ionicons } from "@expo/vector-icons";
-import * as Haptics from "expo-haptics";
-import * as FileSystem from "expo-file-system";
-import { CameraView, useCameraPermissions } from "expo-camera";
-
-import { theme } from "@/src/theme";
-import { useEvento } from "@/src/ctx/evento";
-import { useSession } from "@/src/ctx/session";
-import { api } from "@/src/utils/api";
-import { extractCedula, parsePdf417 } from "@/src/utils/cedula";
-import { errorMessage } from "@/src/utils/errors";
-import { analizarConGemini } from "@/src/services/geminiService";
-import { LocalCedulaCamera, localScannerAvailable, type LocalCameraRef } from "@/src/components/LocalCedulaCamera";
-import { isMrzText } from "@/src/utils/mrzValidation";
-import { mrzIdentityCandidate } from "@/src/utils/mrzIdentityReview";
-import { useMrzIdentityReview } from "@/src/components/MrzIdentityReview";
-
-const PILL_TIMEOUT = 2500;
-const RAW_SCAN_COOLDOWN_MS = 900;
-const SCANNER_REARM_DELAY_MS = 450;
-const ABSOLUTE_FILL = { position: "absolute" as const, top: 0, right: 0, bottom: 0, left: 0 };
-const COLOMBIAN_DASH_PAYLOAD_RE = /(?:^|[^A-Z0-9])([A-Z])-\d{5,8}-\d{5,10}-([MF])-(\d{5,11})-((?:19|20)\d{6})(?:[^0-9]|$)/i;
-const QR_ID_KEY_RE = /(?:^|[?&#;,\s{\["'])\s*(?:nuip|cedula|c[eÃ©]dula|cc|doc|documento|document_number|documentnumber|numero_documento|identificacion|identificaci[oÃ³]n)\s*["']?\s*[:=/#-]\s*["']?([0-9][0-9\s.,-]{3,20}[0-9])/i;
-const QR_PREFIX_RE = /(?:^|[^A-Z0-9])(?:CC|NUIP|DOC|CEDULA|DOCUMENTO)\s*[:#-]?\s*([0-9][0-9\s.,-]{3,20}[0-9])(?:[^0-9]|$)/i;
-
-type DocumentPreview = {
-  cedula: string;
-  nombre: string;
-  fecha: string;
-  fechaExpiracion?: string;
-  fuente?: string;
-  mrzValido?: boolean;
-  duplicate?: boolean;
-  baseStatus?: string;
-};
-
-type Mode = "camera" | "manual";
-type ParsedCedulaResult = ReturnType<typeof parsePdf417>;
-type ServerParsedCedula = Partial<Pick<
-  ParsedCedulaResult,
-  | "cedula"
-  | "nombres"
-  | "primer_apellido"
-  | "segundo_apellido"
-  | "genero"
-  | "fecha_nacimiento"
-  | "fecha_expiracion"
-  | "tipo_sangre"
-  | "mrz_valido"
->>;
-type OcrReadResult = { raw: string; serverParsed?: ServerParsedCedula };
-function scannedPayload(raw?: string | null, data?: string | null): string {
-  for (const value of [raw, data]) {
-    const text = String(value || "").trim();
-    if (text && !/^(null|undefined)$/i.test(text)) return text;
-  }
-  return "";
-}
-
-function safeDecodeURIComponent(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
-function cleanQrDigits(value: string): string {
-  const digits = String(value || "").replace(/\D/g, "").replace(/^0+/, "");
-  if (!/^\d{5,11}$/.test(digits)) return "";
-  if (/^(19|20)\d{2}$/.test(digits)) return "";
-  if (/^(19|20)\d{6}$/.test(digits)) return "";
-  return digits;
-}
-
-function cleanCedulaNumber(value: string | null | undefined): string {
-  return cleanQrDigits(String(value || ""));
-}
-
-function parsedFullName(parsed: ParsedCedulaResult): string {
-  return [
-    parsed.nombres,
-    parsed.primer_apellido,
-    parsed.segundo_apellido,
-  ].filter(Boolean).join(" ").trim();
-}
-
-function extractQrCedulaPayload(raw: string): string {
-  const original = String(raw || "").trim();
-  if (!original) return "";
-
-  const variants = Array.from(new Set([
-    original,
-    safeDecodeURIComponent(original),
-    original.replace(/&amp;/gi, "&"),
-    safeDecodeURIComponent(original.replace(/&amp;/gi, "&")),
-  ])).filter(Boolean);
-
-  for (const value of variants) {
-    if (/^\s*\d[\d\s.,-]*\s*$/.test(value)) {
-      const direct = cleanQrDigits(value);
-      if (direct) return direct;
-    }
-
-    const keyMatch = value.match(QR_ID_KEY_RE);
-    if (keyMatch) {
-      const digits = cleanQrDigits(keyMatch[1]);
-      if (digits) return digits;
-    }
-
-    const prefixed = value.match(QR_PREFIX_RE);
-    if (prefixed) {
-      const digits = cleanQrDigits(prefixed[1]);
-      if (digits) return digits;
-    }
-
-    if (/^\s*\{/.test(value)) {
-      try {
-        const json = JSON.parse(value);
-        const findLabeledId = (node: unknown): string => {
-          if (Array.isArray(node)) {
-            for (const child of node) {
-              if (child && typeof child === "object") {
-                const found = findLabeledId(child);
-                if (found) return found;
-              }
-            }
-          } else if (node && typeof node === "object") {
-            for (const [key, child] of Object.entries(node as Record<string, unknown>)) {
-              if (/^(nuip|cedula|c[eÃ©]dula|cc|doc|documento|document_number|documentnumber|numero_documento|identificacion|identificaci[oÃ³]n)$/i.test(key)
-                && (typeof child === "string" || typeof child === "number")
-                && /^\s*\d[\d\s.,-]*\s*$/.test(String(child))) {
-                const found = cleanQrDigits(String(child));
-                if (found) return found;
-              }
-              if (child && typeof child === "object") {
-                const found = findLabeledId(child);
-                if (found) return found;
-              }
-            }
-          }
-          return "";
-        };
-        const found = findLabeledId(json);
-        if (found) return found;
-      } catch {
-        // ignore malformed QR JSON
-      }
-    }
-  }
-
-  return "";
-}
-
-function isReliableBarcode(raw: string, currentMode: Mode): boolean {
-  if (parsePdf417(raw).formato_detectado?.startsWith("pdf417_binario")) return true;
-  const value = String(raw || "").trim();
-  if (!value) return false;
-  if (currentMode === "manual") return true;
-  if (extractQrCedulaPayload(value)) return true;
-  if (/^\d{5,11}$/.test(value)) return true;
-  if (/[?&](nuip|cedula|cc|doc)[=:]?\d{5,11}/i.test(value)) return true;
-  if (/^(?:CC|NUIP|DOC|CEDULA)[:\s]?\d{5,11}$/i.test(value)) return true;
-  if (value.includes("PubDSK_") || (value.includes("\u0000") && value.length >= 120)) return true;
-  const parsed = parsePdf417(value);
-  if (parsed.formato_detectado?.startsWith("pdf417_binario")) return true;
-  if (
-    currentMode === "camera"
-    && parsed.cedula
-    && (
-      value.includes("IDCOL")
-      || value.includes("ICCOL")
-      || value.includes("<<")
-      || value.includes("|")
-      || /C[EÃ‰]DULA|CC|NUIP|DOCUMENTO|NUMERO|NÃšMERO|IDENTIFIC/i.test(value)
-      || COLOMBIAN_DASH_PAYLOAD_RE.test(value)
-    )
-  ) return true;
-  if (/^\d{5,11}$/.test(value)) return true;
-  if (value.includes("IDCOL") || value.includes("ID<COL") || value.includes("ICCOL") || value.includes("IC<COL")) return true;
-  if (COLOMBIAN_DASH_PAYLOAD_RE.test(value)) return true;
-  if (/^\d{5,11}\|/.test(value)) return true;
-  // No inferir el NUIP de QR oficiales cifrados/opacos.
-  if (/[?&](nuip|cedula|cc|doc)[=:]?\d{5,11}/i.test(value)) return true;
-  // QR con solo nÃºmero precedido de prefijo (ej. "CC1023456789" o "NUIP:1023456789")
-  if (/^(?:CC|NUIP|DOC|CEDULA)[:\s]?\d{5,11}$/i.test(value)) return true;
-  return false;
-}
-
-function normalizeQrCedulaPayload(raw: string): string {
-  // This helper also receives PDF417. Never normalize or trim its positional bytes as QR text.
-  if (raw.includes("\u0000") || raw.includes("PubDSK_")
-    || parsePdf417(raw).formato_detectado?.startsWith("pdf417_binario")) return raw;
-  const value = String(raw || "").trim();
-  const extracted = extractQrCedulaPayload(value);
-  if (extracted) return extracted;
-  const qrUrlMatch = value.match(/[?&](?:nuip|cedula|cc|doc)[=:]?(\d{5,11})/i);
-  if (qrUrlMatch) return qrUrlMatch[1];
-
-  const prefixedMatch = value.match(/^(?:CC|NUIP|DOC|CEDULA)[:\s]?(\d{5,11})$/i);
-  if (prefixedMatch) return prefixedMatch[1];
-
-  return value;
-}
-
-function extractCedulaFromCameraPayload(raw: string, type?: string): string {
-  if (/qr|datamatrix/i.test(String(type || ""))) {
-    return extractQrCedulaPayload(raw);
-  }
-  const normalized = normalizeQrCedulaPayload(raw);
-  const parsed = parsePdf417(normalized);
-  return cleanCedulaNumber(parsed.cedula || extractCedula(normalized) || "");
-}
-
-export default function EscanearScreen() {
-  const router = useRouter();
-  const { user } = useSession();
-  const membershipActive = user?.subscription_status === "internal" ||
-    ((user?.subscription_status === "active" || user?.subscription_status === "trial") &&
-      !!user.current_period_ends_at && Date.parse(user.current_period_ends_at) > Date.now());
-  const [isFocused, setIsFocused] = useState(false);
-  const [cameraReady, setCameraReady] = useState(false);
-  const [torchEnabled, setTorchEnabled] = useState(false);
-  const cameraReadBusy = useRef(false);
-  const localCameraRef = useRef<LocalCameraRef | null>(null);
-  const {
-    eventoId,
-    eventoNombre,
-    registros,
-    totalRegistros,
-    misEscaneos,
-    scan,
-    wsStatus,
-    activos,
-    duplicadosBloqueados,
-    queueSize,
-    clearEvento,
-  } = useEvento();
-
-  const [mode, setMode] = useState<Mode>("camera");
-  const [cedulaInput, setCedulaInput] = useState("");
-  const [ocrLoading, setOcrLoading] = useState(false);
-  const [barcodeLoading, setBarcodeLoading] = useState(false);
-  const [documentPreview, setDocumentPreview] = useState<DocumentPreview | null>(null);
-  const [iaLoading, setIaLoading] = useState(false);
-  const [scannerEnabled, setScannerEnabled] = useState(true);
-  const { requestReview, cancelReview, dialog } = useMrzIdentityReview();
-  const scanGeneration = useRef(0);
-  useEffect(() => { scanGeneration.current++; cancelReview(); }, [eventoId, isFocused, mode, cancelReview]);
-
-
-  const [permission, requestPermission] = useCameraPermissions();
-  const [toast, setToast] = useState<{ kind: "ok" | "dup" | "err"; text: string } | null>(null);
-  const lastScanRef = useRef<{ value: string; at: number } | null>(null);
-  const lastRawScanRef = useRef<{ value: string; at: number } | null>(null);
-  const scanBusyRef = useRef(false);
-  const iaLoadingRef = useRef(false);
-  const ocrLoadingRef = useRef(false);
-  const barcodeLoadingRef = useRef(false);
-  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const documentPreviewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const scannerRearmTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const flashAnim = useRef(new Animated.Value(0)).current;
-  const scanLineAnim = useRef(new Animated.Value(0)).current;
-  const cameraRef = useRef<any>(null);
-  // Android usa LocalCedulaCamera (CameraX), no Expo CameraView. Las rutinas
-  // de captura deben aceptar cualquiera de las dos referencias.
-  const hasCamera = useCallback(() => !!(localCameraRef.current || cameraRef.current), []);
-  const [reticleHeight, setReticleHeight] = useState(0);
-
-  useFocusEffect(useCallback(() => {
-    setIsFocused(true);
-    return () => setIsFocused(false);
-  }, []));
-
-  const showToast = useCallback((kind: "ok" | "dup" | "err", text: string) => {
-    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    setToast({ kind, text });
-    toastTimerRef.current = setTimeout(() => setToast(null), PILL_TIMEOUT);
-  }, []);
-
-  const flashDuplicate = useCallback(() => {
-    flashAnim.setValue(1);
-    Animated.timing(flashAnim, { toValue: 0, duration: 600, useNativeDriver: false }).start();
-  }, [flashAnim]);
-
-  const rearmScanner = useCallback((delay = SCANNER_REARM_DELAY_MS) => {
-    if (scannerRearmTimerRef.current) clearTimeout(scannerRearmTimerRef.current);
-    scannerRearmTimerRef.current = setTimeout(() => {
-      scannerRearmTimerRef.current = null;
-      setScannerEnabled(true);
-    }, delay);
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-      if (documentPreviewTimerRef.current) clearTimeout(documentPreviewTimerRef.current);
-      if (scannerRearmTimerRef.current) clearTimeout(scannerRearmTimerRef.current);
-    };
-  }, []);
-
-  useEffect(() => {
-    setScannerEnabled(mode === "camera");
-  }, [mode]);
-
-  const buildDocumentPreview = useCallback((cedula: string, parsed: ReturnType<typeof parsePdf417>, fuente?: string): DocumentPreview => {
-    const nombre = [
-      parsed.nombres,
-      parsed.primer_apellido,
-      parsed.segundo_apellido,
-    ].filter(Boolean).join(" ").trim();
-    return {
-      cedula,
-      nombre,
-      fecha: parsed.fecha_nacimiento || parsed.fecha_expiracion || "",
-      fechaExpiracion: parsed.fecha_expiracion,
-      fuente,
-      mrzValido: parsed.mrz_valido,
-    };
-  }, []);
-
-  useEffect(() => {
-  if (mode === "camera" && !permission?.granted && permission?.canAskAgain !== false) {
-      requestPermission();
-    }
-  }, [mode, permission, requestPermission]);
-
-  useEffect(() => {
-    if (mode !== "camera") {
-      scanLineAnim.stopAnimation();
-      scanLineAnim.setValue(0);
-      return;
-    }
-
-    const animation = Animated.loop(
-      Animated.sequence([
-        Animated.timing(scanLineAnim, { toValue: 1, duration: 1800, useNativeDriver: true }),
-        Animated.timing(scanLineAnim, { toValue: 0, duration: 1800, useNativeDriver: true }),
-      ]),
-    );
-    animation.start();
-    return () => animation.stop();
-  }, [mode, scanLineAnim]);
-
-  const captureCameraBase64 = useCallback(async (quality: number, skipProcessing = true): Promise<string> => {
-    if (localCameraRef.current) return await localCameraRef.current.capture();
-    if (!cameraRef.current) return "";
-    if (typeof cameraRef.current.takePhoto === "function") {
-      const photo = await cameraRef.current.takePhoto({ flash: "off" });
-      const path = photo?.path ? String(photo.path) : "";
-      if (!path) return "";
-      const uri = path.startsWith("file://") ? path : `file://${path}`;
-      return FileSystem.readAsStringAsync(uri, { encoding: "base64" });
-    }
-
-    const photo = await cameraRef.current.takePictureAsync({
-      quality,
-      base64: true,
-      skipProcessing,
-    });
-    return photo?.base64 || "";
-  }, []);
-
-  const readCameraWithGemini = useCallback(async (imageBase64?: string): Promise<ServerParsedCedula | null> => {
-    if ((!imageBase64 && !hasCamera()) || iaLoadingRef.current) return null;
-    iaLoadingRef.current = true;
-    setIaLoading(true);
-    try {
-      const b64 = imageBase64 || await captureCameraBase64(0.78, false);
-      if (!b64) return null;
-      const iaResult = await analizarConGemini(b64);
-      return iaResult?.cedula ? iaResult : null;
-    } catch {
-      return null;
-    } finally {
-      iaLoadingRef.current = false;
-      setIaLoading(false);
-    }
-  }, [captureCameraBase64, hasCamera]);
-
-  const readCameraWithOcr = useCallback(async (imageBase64?: string): Promise<OcrReadResult> => {
-    if ((!imageBase64 && !hasCamera()) || ocrLoadingRef.current) return { raw: "" };
-    ocrLoadingRef.current = true;
-    setOcrLoading(true);
-    try {
-      const b64 = imageBase64 || await captureCameraBase64(0.72, false);
-      if (!b64) return { raw: "" };
-      const res = await api.ocrCedula(b64);
-      if (res.ok && res.cedula) {
-        const raw = res.cedula;
-        const serverParsed = { ...res.parsed, cedula: res.cedula, mrz_valido: res.mrz_valido ?? res.parsed?.mrz_valido };
-        return { raw, serverParsed };
-      }
-      return { raw: "" };
-    } catch {
-      return { raw: "" };
-    } finally {
-      ocrLoadingRef.current = false;
-      setOcrLoading(false);
-    }
-  }, [captureCameraBase64, hasCamera]);
-
-  const readCameraBarcode = useCallback(
-    async (silent = false, imageBase64?: string, options: { preferMrz?: boolean; timeoutMs?: number } = {}): Promise<OcrReadResult> => {
-      if ((!imageBase64 && !hasCamera()) || barcodeLoadingRef.current) return { raw: "" };
-      barcodeLoadingRef.current = true;
-      setBarcodeLoading(true);
-      try {
-        const b64 = imageBase64 || await captureCameraBase64(options.preferMrz ? 0.78 : 0.68);
-        if (!b64) return { raw: "" };
-        const res = await api.barcodeCedula(b64, { preferMrz: !!options.preferMrz, timeoutMs: options.timeoutMs });
-        if (res.ok && res.cedula) {
-          const raw = res.cedula;
-          const serverParsed = { ...res.parsed, cedula: res.cedula, mrz_valido: res.mrz_valido ?? res.parsed?.mrz_valido };
-          return { raw, serverParsed };
-        }
-        return { raw: "" };
-      } catch (e: any) {
-        if (!silent) showToast("err", errorMessage(e, "Error leyendo barras"));
-        return { raw: "" };
-      } finally {
-        barcodeLoadingRef.current = false;
-        setBarcodeLoading(false);
-      }
-    },
-    [captureCameraBase64, hasCamera, showToast],
-  );
-
-  const handleScan = useCallback(
-    async (raw: string, options: { skipBarcodeFallback?: boolean; serverParsed?: ServerParsedCedula } = {}): Promise<boolean> => {
-      if (!membershipActive) {
-        showToast("err", "La membresÃ­a de esta empresa no estÃ¡ activa. Contacta a JM ServiceTec.");
-        return false;
-      }
-      if (scanBusyRef.current) return false;
-      const ticket = scanGeneration.current;
-      const current = () => ticket === scanGeneration.current && AppState.currentState === 'active';
-      scanBusyRef.current = true;
-      setScannerEnabled(false);
-      try {
-        const candidate = mrzIdentityCandidate(raw);
-        if (isMrzText(raw) && !candidate) {
-          showToast("err", "MRZ incompleta o con controles incorrectos. Vuelve a leerla.");
-          return false;
-        }
-        const binary = raw.includes('\u0000') || raw.includes('PubDSK_');
-        let rawToUse = candidate || binary ? raw : normalizeQrCedulaPayload(raw);
-        let reviewedName: string | undefined;
-        let inheritedServerParsed = options.serverParsed;
-        const hasServerParsed = () => !!inheritedServerParsed && Object.keys(inheritedServerParsed).length > 0;
-        const canUseServerParsed = () => hasServerParsed() && !!cleanCedulaNumber(inheritedServerParsed?.cedula);
-        const buildParsed = (): ParsedCedulaResult => candidate ? parsePdf417(rawToUse) : canUseServerParsed()
-          ? {
-              cedula: inheritedServerParsed?.cedula || "",
-              nombres: inheritedServerParsed?.nombres || "",
-              primer_apellido: inheritedServerParsed?.primer_apellido || "",
-              segundo_apellido: inheritedServerParsed?.segundo_apellido || "",
-              genero: inheritedServerParsed?.genero || "",
-              fecha_nacimiento: inheritedServerParsed?.fecha_nacimiento || "",
-              fecha_expiracion: inheritedServerParsed?.fecha_expiracion || "",
-              tipo_sangre: inheritedServerParsed?.tipo_sangre || "",
-              formato_detectado: "ocr_servidor",
-              mrz_valido: inheritedServerParsed?.mrz_valido,
-              raw_mrz: [],
-              raw: rawToUse,
-            }
-          : parsePdf417(rawToUse);
-        // Fallback real para fotos/cÃ³digos incompletos. La versiÃ³n anterior
-        // tenÃ­a esta ruta activa; dejarla en `false` hacÃ­a que una foto nunca
-        // llegara al lector de PDF417/MRZ del backend.
-        const tryImageFallback = async (startMessage: string): Promise<boolean> => {
-          if (mode !== "camera" || options.skipBarcodeFallback) return false;
-          showToast("err", startMessage);
-          const imageBase64 = await captureCameraBase64(0.78, false);
-          if (!imageBase64) return false;
-          const recovered = await readCameraBarcode(true, imageBase64, { preferMrz: true, timeoutMs: 9000 });
-          if (!recovered.raw && !recovered.serverParsed?.cedula) return false;
-          rawToUse = recovered.raw ? normalizeQrCedulaPayload(recovered.raw) : rawToUse;
-          inheritedServerParsed = recovered.serverParsed;
-          return true;
-        };
-        if (!canUseServerParsed() && !isReliableBarcode(rawToUse, mode)) {
-          if (mode === "camera") {
-            const recovered = await tryImageFallback("Codigo incompleto. Intentando con IA...");
-            if (!recovered) {
-              await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-              showToast("err", "No pude leerla. Alinea la cedula completa y evita reflejos.");
-              return false;
-            }
-          } else {
-            await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-            showToast("err", "No pude confirmar la cÃ©dula.");
-            return false;
-          }
-        }
-
-        let parsed = buildParsed();
-        let cedula = cleanCedulaNumber(parsed.cedula || extractCedula(rawToUse) || "");
-        if (!cedula && mode === "camera") {
-          const recovered = await tryImageFallback("Codigo sin NUIP. Intentando con IA...");
-          if (recovered) {
-            parsed = buildParsed();
-            cedula = cleanCedulaNumber(parsed.cedula || extractCedula(rawToUse) || "");
-          }
-        }
-        if (!cedula) {
-          showToast("err", "No pude confirmar la cÃ©dula. Usa la camara completa o manual.");
-          return false;
-        }
-        if (candidate) {
-          const confirmed = await requestReview(candidate);
-          if (!confirmed || !current()) return false;
-          const identityChanged = confirmed.cedula !== cedula;
-          cedula = confirmed.cedula; reviewedName = confirmed.nombre;
-          parsed = { ...parsed, cedula, nombres: confirmed.nombre, primer_apellido: "", segundo_apellido: "",
-            mrz_valido: identityChanged ? false : parsed.mrz_valido, formato_detectado: "MRZ revisada",
-            ...(identityChanged ? { fecha_nacimiento: "", fecha_expiracion: "", genero: "" } : {}) };
-        }
-        if (!current()) return false;
-        const now = Date.now();
-        if (lastScanRef.current && lastScanRef.current.value === cedula && now - lastScanRef.current.at < 1500) {
-          return false;
-        }
-        lastScanRef.current = { value: cedula, at: now };
-
-        const nombre = reviewedName || parsedFullName(parsed);
-
-        const res = await scan(cedula, {
-          nombre,
-        });
-        if (res.ok) {
-          setDocumentPreview(buildDocumentPreview(cedula, { ...parsed, nombres: nombre, primer_apellido: "", segundo_apellido: "" }, parsed.formato_detectado || "camara"));
-          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-          if (documentPreviewTimerRef.current) clearTimeout(documentPreviewTimerRef.current);
-          documentPreviewTimerRef.current = setTimeout(() => setDocumentPreview(null), 4500);
-          // La base es opcional: guardar primero el escaneo y consultar despuÃ©s,
-          // sin afectar el registro si no hay base o la consulta falla.
-          if (eventoId) void api.buscarEnBase(eventoId, cedula).then((match) => {
-            if (!match.base_available || !match.found) return;
-            setDocumentPreview((current) => current?.cedula === cedula
-              ? { ...current, baseStatus: `En base Â· ${[match.work_site, match.municipality].filter(Boolean).join(" Â· ") || match.display_name}` }
-              : current);
-          }).catch(() => undefined);
-          if (mode !== "camera") showToast("ok", `CÃ©dula ${cedula} registrada`);
-        } else if (res.duplicate) {
-          setDocumentPreview({ ...buildDocumentPreview(cedula, { ...parsed, nombres: nombre, primer_apellido: "", segundo_apellido: "" }, parsed.formato_detectado || "camara"), duplicate: true });
-          if (documentPreviewTimerRef.current) clearTimeout(documentPreviewTimerRef.current);
-          documentPreviewTimerRef.current = setTimeout(() => setDocumentPreview(null), 2200);
-          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
-          flashDuplicate();
-          if (mode !== "camera") showToast("dup", `AtenciÃ³n: ${cedula} ya registrada`);
-        } else {
-          await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-          showToast("err", res.mensaje);
-        }
-        return !!(res.ok || res.duplicate);
-      } catch {
-        showToast("err", "No se confirmÃ³ el registro. Revisa la conexiÃ³n y vuelve a intentarlo.");
-        return false;
-      } finally {
-        scanBusyRef.current = false;
-        if (mode === "camera") rearmScanner();
-      }
-    },
-    [mode, eventoId, scan, showToast, flashDuplicate, buildDocumentPreview, rearmScanner, captureCameraBase64, readCameraBarcode, requestReview, membershipActive],
-  );
-
-  const captureAndDecodeBarcode = useCallback(async () => {
-    if (!hasCamera() || cameraReadBusy.current || scanBusyRef.current) return;
-    const ticket = scanGeneration.current;
-    cameraReadBusy.current = true;
-    try {
-      if (localCameraRef.current) {
-        setBarcodeLoading(true);
-        const result = await localCameraRef.current.readPdf417();
-        if (ticket !== scanGeneration.current || AppState.currentState !== 'active') return;
-        if (!result.raw) {
-          showToast("err", "PDF417 no detectado. Incluye toda la barra, evita reflejos y toca para enfocar.");
-          return;
-        }
-        if (!extractCedulaFromCameraPayload(result.raw, 'pdf417')) {
-          showToast("err", "PDF417 detectado, pero su formato no se pudo interpretar. No se guardÃ³ el registro.");
-          return;
-        }
-        await handleScan(result.raw, { skipBarcodeFallback: true });
-        return;
-      }
-      const imageBase64 = await captureCameraBase64(0.65);
-      if (!imageBase64) {
-        showToast("err", "No pude tomar la foto. Intenta de nuevo.");
-        return;
-      }
-
-      showToast("err", "Leyendo PDF417...");
-      const barcodeResult = await readCameraBarcode(false, imageBase64, { preferMrz: false, timeoutMs: 7000 });
-      if (barcodeResult.raw) {
-        await handleScan(barcodeResult.raw, {
-          skipBarcodeFallback: true,
-          serverParsed: barcodeResult.serverParsed,
-        });
-        return;
-      }
-
-      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
-      showToast("err", "PDF417 no detectado. Alinea el cÃ³digo completo y vuelve a intentar.");
-    } catch (error) {
-      showToast("err", errorMessage(error, "No se pudo completar la lectura del PDF417."));
-    } finally {
-      cameraReadBusy.current = false;
-      setBarcodeLoading(false);
-    }
-  }, [captureCameraBase64, handleScan, hasCamera, readCameraBarcode, showToast]);
-
-  const onManualSubmit = async () => {
-    const cedula = extractCedula(cedulaInput);
-    if (!cedula) {
-      Alert.alert("CÃ©dula invÃ¡lida", "Ingresa un nÃºmero entre 6 y 11 dÃ­gitos");
-      return;
-    }
-    await handleScan(cedula);
-
-  };
-
-
-  const statusColor = wsStatus === "online" ? theme.success : wsStatus === "connecting" ? theme.warning : theme.error;
-  const statusLabel = wsStatus === "online" ? "En linea" : wsStatus === "connecting" ? "Conectando..." : "Sin tiempo real";
-  const recientes = useMemo(() => registros.slice(0, 5), [registros]);
-
-  if (!eventoId) {
-    return (
-      <SafeAreaView style={styles.container} edges={["top", "left", "right"]}>
-        <View style={styles.emptyWrap}>
-          <Ionicons name="calendar-outline" size={64} color={theme.textDisabled} />
-          <Text style={styles.emptyTitle}>Selecciona un evento</Text>
-          <Text style={styles.emptySub}>Necesitas un evento activo para escanear cÃ©dulas.</Text>
-          <TouchableOpacity testID="go-to-eventos" style={styles.primaryBtn} onPress={() => router.push("/(app)/eventos")}>
-            <Text style={styles.primaryBtnText}>Ir a Eventos</Text>
-          </TouchableOpacity>
-        </View>
-      </SafeAreaView>
-    );
-  }
-
-  const flashBg = flashAnim.interpolate({ inputRange: [0, 1], outputRange: ["rgba(255,59,48,0)", "rgba(255,59,48,0.35)"] });
-  const scanLineTranslateY = scanLineAnim.interpolate({
-    inputRange: [0, 1],
-    outputRange: [0, Math.max(reticleHeight - 3, 0)],
-  });
-
-  return (
-    <SafeAreaView style={[styles.container, mode === "camera" && styles.cameraContainer]} edges={["top", "left", "right"]}>
-      <Animated.View pointerEvents="none" style={[ABSOLUTE_FILL, { backgroundColor: flashBg, zIndex: 100 }]} />
-
-      {mode === "camera" ? <View style={styles.cameraTopBar}>
-        <TouchableOpacity testID="change-event-button" style={styles.cameraHeaderButton} onPress={() => router.back()} accessibilityLabel="Cerrar escÃ¡ner"><Ionicons name="close" size={23} color="#fff" /><Text style={styles.cameraHeaderButtonLabel}>Salir</Text></TouchableOpacity>
-        <View style={styles.cameraHeaderTitle}><Text style={styles.cameraBrand}>JM ServiceTec</Text><Text style={styles.cameraEventName} numberOfLines={1}>{eventoNombre}</Text></View>
-        <TouchableOpacity style={styles.cameraHeaderButton} onPress={() => setTorchEnabled((value) => !value)} accessibilityLabel={torchEnabled ? "Apagar luz" : "Encender luz"}><Ionicons name={torchEnabled ? "flash" : "flash-outline"} size={21} color="#fff" /><Text style={styles.cameraHeaderButtonLabel}>{torchEnabled ? "Luz ON" : "Luz"}</Text></TouchableOpacity>
-      </View> : <View style={styles.topBar}>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.eventTitle} numberOfLines={1}>{eventoNombre}</Text>
-          <View style={styles.statusRow}><View style={[styles.dot, { backgroundColor: statusColor }]} /><Text testID="sync-status-indicator" style={[styles.statusText, { color: statusColor }]}>{statusLabel}</Text><Text style={styles.statusMeta}> Â· {activos} dispositivos Â· cola {queueSize}</Text></View>
-        </View>
-        <View style={styles.topActions}><TouchableOpacity style={styles.switchEventBtn} onPress={clearEvento}><Ionicons name="swap-horizontal" size={18} color={theme.text} /></TouchableOpacity><View style={styles.counterPill}><Text testID="scan-counter" style={styles.counterValue}>{misEscaneos}</Text><Text style={styles.counterLabel}>tus escaneos</Text></View></View>
-      </View>}
-
-      {mode === "manual" && <View style={styles.modeRow}>
-        <TouchableOpacity
-          testID="mode-camera-toggle"
-          style={styles.modeBtn}
-          onPress={() => setMode("camera")}
-        >
-          <Ionicons name="scan" size={16} color={theme.textSecondary} />
-          <Text style={styles.modeText}>Camara</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          testID="manual-entry-toggle"
-          style={[styles.modeBtn, mode === "manual" && styles.modeBtnActive]}
-          onPress={() => setMode("manual")}
-        >
-          <Ionicons name="keypad" size={16} color={mode === "manual" ? "#fff" : theme.textSecondary} />
-          <Text style={[styles.modeText, mode === "manual" && { color: "#fff" }]}>Manual</Text>
-        </TouchableOpacity>
-      </View>}
-
-      {mode === "camera" && isFocused ? (
-        <View style={styles.cameraWrap} testID="scanner-camera-view">
-          {!permission ? (
-            <View style={styles.camPlaceholder}><Text style={styles.permText}>Iniciando cÃ¡mara...</Text></View>
-          ) : !permission.granted ? (
-            <View style={styles.camPlaceholder}>
-              <Ionicons name="camera-outline" size={56} color={theme.textSecondary} />
-              <Text style={styles.permTitle}>Acceso a la cÃ¡mara</Text>
-              <Text style={styles.permText}>Para leer PDF417, QR, MRZ o numero impreso.</Text>
-              <TouchableOpacity testID="grant-camera-permission" style={styles.primaryBtn} onPress={() => requestPermission()}>
-                <Text style={styles.primaryBtnText}>Otorgar permiso</Text>
-              </TouchableOpacity>
-            </View>
-          ) : (
-            <>
-            {Platform.OS === "android" && localScannerAvailable ? (
-              <LocalCedulaCamera
-                ref={localCameraRef}
-                style={ABSOLUTE_FILL}
-                active={isFocused && scannerEnabled}
-                torch={torchEnabled}
-                onTorchChange={setTorchEnabled}
-                onMrz={(raw) => cameraReadBusy.current ? Promise.resolve(false) : handleScan(raw, { skipBarcodeFallback: true })}
-                onBarcode={(raw, type) => {
-                  if (!raw || scanBusyRef.current || cameraReadBusy.current) return false;
-                  if (!extractCedulaFromCameraPayload(raw, type)) {
-                    if (type === "pdf417" && (!lastRawScanRef.current || Date.now() - lastRawScanRef.current.at > 2500)) {
-                      lastRawScanRef.current = { value: raw, at: Date.now() };
-                      showToast("err", "PDF417 detectado, pero su contenido no se pudo interpretar. No se guardÃ³ una cÃ©dula supuesta.");
-                    }
-                    return false;
-                  }
-                  void handleScan(raw, { skipBarcodeFallback: true });
-                  return true;
-                }}
-              >
-                <View pointerEvents="none" style={styles.reticleOverlay}>
-                  <View style={[styles.reticle, styles.backReticle]}>
-                    <View style={[styles.reticleCorner, styles.reticleCornerTopLeft]} /><View style={[styles.reticleCorner, styles.reticleCornerTopRight]} />
-                    <View style={[styles.reticleCorner, styles.reticleCornerBottomLeft]} /><View style={[styles.reticleCorner, styles.reticleCornerBottomRight]} />
-                  </View>
-                </View>
-              </LocalCedulaCamera>
-            ) : (
-            <CameraView
-  ref={cameraRef}
-  onCameraReady={() => setCameraReady(true)}
-  style={ABSOLUTE_FILL}
-  enableTorch={torchEnabled}
-  facing="back"
-  autofocus="on"
-  barcodeScannerSettings={{
-    barcodeTypes: ["pdf417", "qr", "datamatrix"],
-  }}
-  onBarcodeScanned={scannerEnabled ? ({ raw, data, type }) => {
-    const payload = scannedPayload(raw, data);
-    if (!payload) return;
-    const normalized = normalizeQrCedulaPayload(payload);
-    const now = Date.now();
-    if (
-      lastRawScanRef.current
-      && lastRawScanRef.current.value === normalized
-      && now - lastRawScanRef.current.at < RAW_SCAN_COOLDOWN_MS
-    ) {
-      return;
-    }
-    lastRawScanRef.current = { value: normalized, at: now };
-    const hasDirectCedula = !!extractCedulaFromCameraPayload(normalized, type);
-    if (!hasDirectCedula) {
-      if (type === "qr") {
-        showToast("err", "QR cifrado o no compatible. No se adivina la cÃ©dula: usa MRZ o registro manual.");
-      }
-      return;
-    }
-    void handleScan(normalized, { skipBarcodeFallback: true });
-              } : undefined}>
-              <View style={styles.reticleOverlay} pointerEvents="none">
-                <View
-                  style={[styles.reticle, styles.backReticle]}
-                  onLayout={({ nativeEvent }) => setReticleHeight(nativeEvent.layout.height)}
-                >
-                  <Animated.View style={[styles.scanLine, { transform: [{ translateY: scanLineTranslateY }] }]} />
-                  <View style={[styles.reticleCorner, styles.reticleCornerTopLeft]} />
-                  <View style={[styles.reticleCorner, styles.reticleCornerTopRight]} />
-                  <View style={[styles.reticleCorner, styles.reticleCornerBottomLeft]} />
-                  <View style={[styles.reticleCorner, styles.reticleCornerBottomRight]} />
-                </View>
-              </View>
-            </CameraView>
-            )}
-            </>
-          )}
-          {permission?.granted && !localScannerAvailable && <View pointerEvents="none" style={styles.cameraInstructions}>
-            <Ionicons name="scan" size={22} color="#062D2A" />
-            <View style={styles.cameraInstructionsText}>
-              <Text style={styles.cameraInstructionsTitle}>Alinea la cÃ©dula dentro del marco</Text>
-              <Text style={styles.cameraInstructionsDetail}>Acerca el documento, evita reflejos y mantÃ©nlo quieto.</Text>
-            </View>
-          </View>}
-          <View style={styles.cameraBottomControls}>
-            <TouchableOpacity style={styles.cameraSideControl} onPress={() => setMode("manual")} accessibilityLabel="Ingreso manual"><Ionicons name="keypad-outline" size={24} color="#fff" /><Text style={styles.cameraControlLabel}>Manual</Text></TouchableOpacity>
-            <View style={styles.cameraReadControl}>
-              <TouchableOpacity testID="decode-pdf417-photo-btn" style={[styles.shutterButton, (barcodeLoading || ocrLoading || iaLoading) && { opacity: 0.6 }]} onPress={captureAndDecodeBarcode} disabled={barcodeLoading || ocrLoading || iaLoading} accessibilityLabel="Leer documento">
-                {barcodeLoading || ocrLoading || iaLoading ? <ActivityIndicator color={theme.brand} /> : <Ionicons name="scan-outline" size={30} color={theme.brand} />}
-              </TouchableOpacity>
-              <Text style={styles.cameraControlLabel}>{barcodeLoading || ocrLoading || iaLoading ? "Leyendoâ€¦" : "Leer ahora"}</Text>
-            </View>
-            <View testID="scan-counter" accessibilityLabel={`Tus escaneos: ${misEscaneos}`} style={styles.cameraCounterBadge}>
-              <Text style={styles.cameraCounterValue}>{misEscaneos}</Text>
-              <Text style={styles.cameraCounterLabel}>TUS REGISTROS</Text>
-            </View>
-          </View>
-        </View>
-      ) : (
-        <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={{ flex: 1 }}>
-          <ScrollView contentContainerStyle={styles.manualScroll} keyboardShouldPersistTaps="handled">
-            <View style={styles.manualCard}>
-              <Text style={styles.manualLabel}>CÃ©dula</Text>
-              <TextInput
-                testID="manual-cedula-input"
-                style={[styles.manualInput, { fontSize: 28, fontWeight: "900", letterSpacing: 2, textAlign: "center" }]}
-                value={cedulaInput}
-                onChangeText={(t) => setCedulaInput(t.replace(/\D/g, ""))}
-                placeholder="123456789"
-                placeholderTextColor={theme.textDisabled}
-                keyboardType="number-pad"
-                autoFocus
-                maxLength={11}
-              />
-
-              <TouchableOpacity testID="manual-submit-button" style={styles.submitBtn} onPress={onManualSubmit}>
-                <Ionicons name="checkmark-circle" size={22} color="#fff" />
-                <Text style={styles.submitBtnText}>Registrar</Text>
-              </TouchableOpacity>
-            </View>
-          </ScrollView>
-        </KeyboardAvoidingView>
-      )}
-
-      {dialog}
-
-      {documentPreview && (
-        <View style={[styles.documentPreview, mode === "camera" && styles.documentPreviewOverlay, documentPreview.duplicate && styles.documentPreviewDuplicate]}>
-          <View style={styles.documentPreviewHeader}>
-            <Ionicons name={documentPreview.duplicate ? "alert-circle" : "checkmark-circle"} size={22} color={documentPreview.duplicate ? "#FF604D" : "#13D390"} />
-            <Text style={styles.documentPreviewTitle}>{documentPreview.duplicate ? "Documento ya registrado" : documentPreview.mrzValido === false ? "Documento leÃ­do" : "Registro realizado"}</Text>
-            <TouchableOpacity style={styles.previewClose} onPress={() => setDocumentPreview(null)} accessibilityLabel="Cerrar aviso"><Ionicons name="close" size={18} color="#fff" /></TouchableOpacity>
-          </View>
-          <View style={styles.previewFooter}><View style={{ flex: 1 }}><Text style={styles.documentPreviewValue}>Documento: {documentPreview.cedula}</Text>{!!documentPreview.baseStatus && <Text style={styles.documentPreviewValue}>{documentPreview.baseStatus}</Text>}</View><View style={[styles.previewBadge, documentPreview.duplicate && styles.previewBadgeDuplicate]}><Text style={styles.previewBadgeText}>{documentPreview.duplicate ? "DUPLICADO" : "GUARDADO"}</Text></View></View>
-        </View>
-      )}
-
-      {/* Recientes */}
-      {mode !== "camera" && <View style={styles.recentWrap}>
-        <View style={styles.recentHeader}>
-          <Text style={styles.recentTitle}>Recientes</Text>
-          <Text style={styles.recentMeta}>{duplicadosBloqueados} duplicados bloqueados</Text>
-        </View>
-        <FlatList
-          data={recientes}
-          keyExtractor={(it) => it.id}
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={{ paddingHorizontal: 16, gap: 8 }}
-          ListEmptyComponent={<Text style={styles.recentEmpty}>AÃºn no hay escaneos.</Text>}
-          renderItem={({ item }) => (
-            <View style={styles.recentChip}>
-              <Text style={styles.recentCedula}>{item.cedula}</Text>
-              <Text style={[styles.recentField, { fontSize: 19, fontWeight: "900" }]}>Registrado</Text>
-              {!!item.nombre && <Text style={styles.recentName} numberOfLines={1}>{item.nombre}</Text>}
-              {!!item.cargo && <Text style={styles.recentField} numberOfLines={1}>{item.cargo}</Text>}
-              {!!item.municipio && <Text style={styles.recentField} numberOfLines={1}>{item.municipio}</Text>}
-            </View>
-          )}
-        />
-      </View>}
-
-      {toast && (
-        <View
-          testID="scan-toast"
-          style={[
-            styles.toast,
-            toast.kind === "ok" && { backgroundColor: theme.successBg, borderColor: theme.success },
-            toast.kind === "dup" && { backgroundColor: theme.errorBg, borderColor: theme.error },
-            toast.kind === "err" && { backgroundColor: theme.warningBg, borderColor: theme.warning },
-          ]}
-        >
-          <Text style={styles.toastText}>{toast.text}</Text>
-        </View>
-      )}
-
-    </SafeAreaView>
-  );
-}
-
-const styles = StyleSheet.create({
-  teacherCard: { marginHorizontal: 16, marginVertical: 8, padding: 16, borderRadius: 16, gap: 5 },
-  teacherAnswer: { color: "#fff", fontSize: 30, fontWeight: "900" },
-  teacherDetail: { color: "#fff", fontSize: 15 },
-  teacherMunicipality: { color: "#fff", fontSize: 20, fontWeight: "700" },
-  container: { flex: 1, backgroundColor: theme.bg },
-  cameraContainer: { backgroundColor: "#090B0D" },
-  cameraTopBar: { minHeight: 68, flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingHorizontal: 16, backgroundColor: "#101624", borderBottomWidth: 1, borderBottomColor: "#26334B" },
-  cameraHeaderButton: { minWidth: 48, minHeight: 54, alignItems: "center", justifyContent: "center", gap: 1 },
-  cameraHeaderButtonLabel: { color: "#E4F4F2", fontSize: 10, fontWeight: "800" },
-  cameraHeaderTitle: { flex: 1, alignItems: "center", paddingHorizontal: 8 },
-  cameraBrand: { color: "#fff", fontSize: 17, fontWeight: "900" },
-  cameraEventName: { color: "#C8D7D8", fontSize: 11, fontWeight: "700", marginTop: 2, maxWidth: "100%" },
-  topBar: { flexDirection: "row", paddingHorizontal: 14, paddingTop: 6, paddingBottom: 8, alignItems: "center", gap: 10 },
-  eventTitle: { color: theme.text, fontSize: 17, fontWeight: "900" },
-  statusRow: { flexDirection: "row", alignItems: "center", marginTop: 4 },
-  dot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },
-  statusText: { fontWeight: "700", fontSize: 12 },
-  statusMeta: { color: theme.textDisabled, fontSize: 11 },
-  topActions: { flexDirection: "row", alignItems: "center", gap: 8 },
-  switchEventBtn: {
-    width: 40,
-    height: 40,
-    borderRadius: 8,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: theme.surface,
-    borderWidth: 1,
-    borderColor: theme.border,
-  },
-  counterPill: { minWidth: 86, backgroundColor: "#087F72", borderWidth: 1, borderColor: "#17B8A4", borderRadius: 14, paddingHorizontal: 12, paddingVertical: 7, alignItems: "center", elevation: 4 },
-  counterValue: { color: "#fff", fontSize: 24, lineHeight: 27, fontWeight: "900", fontVariant: ["tabular-nums"] },
-  counterLabel: { color: "#D7FFF8", fontSize: 9, fontWeight: "900", textTransform: "uppercase", letterSpacing: 0.8 },
-  modeRow: { flexDirection: "row", marginHorizontal: 14, marginBottom: 8, backgroundColor: theme.surface, borderRadius: 8, padding: 3, borderWidth: 1, borderColor: theme.border },
-  modeBtn: { flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center", paddingVertical: 9, borderRadius: 6, gap: 6 },
-  modeBtnActive: { backgroundColor: theme.brand },
-  modeText: { color: theme.textSecondary, fontWeight: "700", fontSize: 13 },
-  cameraWrap: { flex: 1, marginHorizontal: 8, borderRadius: 18, overflow: "hidden", backgroundColor: "#000", borderWidth: 1, borderColor: "#26334B" },
-  camPlaceholder: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24, gap: 12 },
-  permTitle: { color: theme.text, fontSize: 18, fontWeight: "800" },
-  permText: { color: theme.textSecondary, fontSize: 13, textAlign: "center" },
-  reticleOverlay: { ...ABSOLUTE_FILL, alignItems: "center", justifyContent: "center", paddingHorizontal: 16 },
-  reticle: { width: "100%", maxWidth: 720, aspectRatio: 1.586, borderRadius: 8, overflow: "hidden", backgroundColor: "rgba(0,0,0,0.12)" },
-  backReticle: { justifyContent: "space-between", padding: 16 },
-  scanLine: { position: "absolute", top: 0, left: 0, right: 0, height: 3, backgroundColor: theme.brandNeon, opacity: 0.95, shadowColor: theme.brandNeon, shadowOpacity: 0.8, shadowOffset: { width: 0, height: 0 }, shadowRadius: 8, zIndex: 3 },
-  reticleCorner: { position: "absolute", width: 38, height: 38, borderColor: "#FFFFFF", zIndex: 4 },
-  reticleCornerTopLeft: { top: 0, left: 0, borderTopWidth: 3, borderLeftWidth: 3 },
-  reticleCornerTopRight: { top: 0, right: 0, borderTopWidth: 3, borderRightWidth: 3 },
-  reticleCornerBottomLeft: { bottom: 0, left: 0, borderBottomWidth: 3, borderLeftWidth: 3 },
-  reticleCornerBottomRight: { bottom: 0, right: 0, borderBottomWidth: 3, borderRightWidth: 3 },
-  qrGuide: { alignSelf: "flex-end", width: "22%", aspectRatio: 1, borderWidth: 2, borderColor: "#fff", borderRadius: 6, backgroundColor: "rgba(255,255,255,0.08)" },
-  mrzGuide: { gap: 5 },
-  mrzGuideLine: { height: 6, borderRadius: 3, backgroundColor: "rgba(255,255,255,0.75)" },
-  reticleHint: { color: "#fff", marginTop: 12, backgroundColor: "rgba(0,0,0,0.6)", paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8, fontSize: 12 },
-  // Keep this below LocalCedulaCamera's live status pill, so scan/reader errors stay visible.
-  cameraInstructions: { position: "absolute", top: 66, left: 14, right: 14, minHeight: 62, flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 14, paddingVertical: 9, borderRadius: 14, backgroundColor: "rgba(238,255,252,0.96)", borderWidth: 2, borderColor: "#55E2CF", elevation: 8 },
-  cameraInstructionsText: { flex: 1 },
-  cameraInstructionsTitle: { color: "#062D2A", fontSize: 14, lineHeight: 18, fontWeight: "900" },
-  cameraInstructionsDetail: { color: "#244B4A", fontSize: 12, lineHeight: 16, fontWeight: "600", marginTop: 2 },
-  cameraBottomControls: { position: "absolute", bottom: 12, left: 14, right: 14, flexDirection: "row", alignItems: "center", justifyContent: "space-between", minHeight: 92, paddingHorizontal: 8, paddingVertical: 7, borderRadius: 20, backgroundColor: "rgba(8,15,18,0.88)", borderWidth: 1, borderColor: "rgba(255,255,255,0.2)" },
-  cameraSideControl: { width: 76, minHeight: 68, alignItems: "center", justifyContent: "center", gap: 3 },
-  cameraReadControl: { alignItems: "center", justifyContent: "center", gap: 3 },
-  cameraControlLabel: { color: "#fff", fontSize: 12, lineHeight: 16, fontWeight: "900" },
-  cameraCounterBadge: { minWidth: 122, minHeight: 76, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, alignItems: "center", justifyContent: "center", backgroundColor: "#102E5D", borderWidth: 1, borderColor: "#398BFF", elevation: 2 },
-  cameraCounterValue: { color: "#fff", fontSize: 34, lineHeight: 38, fontWeight: "900", fontVariant: ["tabular-nums"] },
-  cameraCounterLabel: { color: "#E0FFFA", fontSize: 10, lineHeight: 14, fontWeight: "900", letterSpacing: 0.5 },
-  shutterButton: { width: 64, height: 64, borderRadius: 32, backgroundColor: "#fff", alignItems: "center", justifyContent: "center", borderWidth: 4, borderColor: theme.brand },
-  captureBtn: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    backgroundColor: theme.brand,
-    paddingHorizontal: 24,
-    paddingVertical: 14,
-    borderRadius: 8,
-    shadowColor: theme.brand,
-    shadowOpacity: 0.5,
-    shadowOffset: { width: 0, height: 4 },
-    shadowRadius: 12,
-    elevation: 6,
-  },
-  captureBtnText: { color: "#fff", fontWeight: "800", fontSize: 15 },
-  manualScroll: { padding: 16, paddingBottom: 24 },
-  manualCard: { backgroundColor: theme.surface, borderRadius: 8, padding: 16, borderWidth: 1, borderColor: theme.border, gap: 8 },
-  manualLabel: { color: theme.textSecondary, fontSize: 11, fontWeight: "700", letterSpacing: 1.2, textTransform: "uppercase", marginTop: 10 },
-  manualInput: { backgroundColor: theme.bg, borderWidth: 1, borderColor: theme.border, borderRadius: 8, paddingHorizontal: 14, paddingVertical: 16, color: theme.text, fontSize: 15 },
-  previewWrap: { marginTop: 12, padding: 12, borderWidth: 1, borderColor: theme.border, borderRadius: 8, gap: 4 },
-  previewTitle: { fontSize: 12, fontWeight: "900", letterSpacing: 1.2, textTransform: "uppercase" },
-  previewName: { color: theme.text, fontWeight: "800", fontSize: 16, marginTop: 4 },
-  previewMeta: { color: theme.textSecondary, fontSize: 13 },
-  submitBtn: { flexDirection: "row", justifyContent: "center", alignItems: "center", gap: 8, backgroundColor: theme.brand, paddingVertical: 16, borderRadius: 8, marginTop: 16 },
-  submitBtnText: { color: "#fff", fontWeight: "800", fontSize: 16 },
-  documentPreview: { marginHorizontal: 14, marginTop: 10, padding: 12, backgroundColor: theme.surface, borderWidth: 1, borderColor: theme.border, borderRadius: 8, gap: 8 },
-  documentPreviewOverlay: { position: "absolute", left: 14, right: 14, bottom: 96, marginHorizontal: 0, marginTop: 0, zIndex: 150, backgroundColor: "rgba(12,16,18,0.92)", borderColor: "rgba(255,255,255,0.06)", borderRadius: 14, padding: 15, shadowColor: "#000", shadowOpacity: 0.32, shadowRadius: 12, elevation: 8 },
-  documentPreviewDuplicate: { borderColor: "rgba(255,96,77,0.35)" },
-  documentPreviewHeader: { flexDirection: "row", alignItems: "center", gap: 8 },
-  documentPreviewTitle: { flex: 1, color: "#fff", fontWeight: "800", fontSize: 13 },
-  previewClose: { width: 25, height: 25, alignItems: "center", justifyContent: "center" },
-  previewFooter: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 10, marginTop: 8 },
-  previewBadge: { backgroundColor: "#087D59", borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
-  previewBadgeDuplicate: { backgroundColor: "#8B2D22" },
-  previewBadgeText: { color: "#fff", fontSize: 9, fontWeight: "900", letterSpacing: 0.3 },
-  documentPreviewSource: { marginLeft: "auto", color: theme.textDisabled, fontWeight: "700", fontSize: 11 },
-  documentPreviewGrid: { flexDirection: "row", gap: 8 },
-  documentPreviewCell: { flex: 1, backgroundColor: theme.bg, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 8 },
-  documentPreviewLabel: { color: theme.textDisabled, fontSize: 10, fontWeight: "800", textTransform: "uppercase", letterSpacing: 1 },
-  documentPreviewValue: { color: "#fff", fontSize: 12, fontWeight: "700", marginTop: 2 },
-  documentPreviewName: { color: theme.textSecondary, fontSize: 13, fontWeight: "700" },
-  documentPreviewMeta: { color: theme.textDisabled, fontSize: 11 },
-  recentWrap: { paddingTop: 12, paddingBottom: 8, borderTopWidth: 1, borderColor: theme.border, backgroundColor: theme.bg },
-  recentHeader: { flexDirection: "row", justifyContent: "space-between", paddingHorizontal: 20, marginBottom: 8 },
-  recentTitle: { color: theme.text, fontWeight: "800", fontSize: 13, textTransform: "uppercase", letterSpacing: 1 },
-  recentMeta: { color: theme.error, fontSize: 11, fontWeight: "700" },
-  recentEmpty: { color: theme.textDisabled, fontSize: 12, paddingHorizontal: 16 },
-  recentChip: { backgroundColor: theme.surface, borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8, borderWidth: 1, borderColor: theme.border, minWidth: 148, maxWidth: 220 },
-  recentCedula: { color: theme.text, fontWeight: "800", fontSize: 14 },
-  recentName: { color: theme.textSecondary, fontSize: 11, marginTop: 2 },
-  recentField: { color: theme.textDisabled, fontSize: 10, marginTop: 1 },
-  toast: { position: "absolute", top: 80, left: 20, right: 20, padding: 14, borderRadius: 14, borderWidth: 1, zIndex: 200 },
-  toastText: { color: theme.text, fontWeight: "800", fontSize: 14, textAlign: "center" },
-  emptyWrap: { flex: 1, alignItems: "center", justifyContent: "center", padding: 32, gap: 12 },
-  emptyTitle: { color: theme.text, fontSize: 20, fontWeight: "800" },
-  emptySub: { color: theme.textSecondary, textAlign: "center" },
-  primaryBtn: { backgroundColor: theme.brand, paddingHorizontal: 20, paddingVertical: 12, borderRadius: 12, marginTop: 12 },
-  primaryBtnText: { color: "#fff", fontWeight: "800", fontSize: 15 },
-});
+YªçŠx-®éÜj×¢ëiºÚ+Š§j[h‘éÜ¢éí×Í8é:-jZ.¶›­–)Ş³V–×÷'B&V7BÂ²W6T6ÆÆ&6²ÂW6TVffV7BÂW6TÖVÖòÂW6U&VbÂW6U7FFRÒg&öÒ'&V7B#°Ğ¦–×÷'B°Ğ¢f–WrÀĞ¢FW‡BÀĞ¢F÷V6†&ÆT÷6—G’ÀĞ¢7G–ÆU6†VWBÀĞ¢FW‡D–çWBÀĞ¢ÆW'BÀĞ¢¶W–&ö&Dfö–F–æuf–WrÀĞ¢ÆFf÷&ÒÀĞ¢67&öÆÅf–WrÀĞ¢fÆDÆ—7BÀĞ¢æ–ÖFVBÀĞ¢7F—f—G”–æF–6F÷"ÀĞ¢7FFRÀĞ§Òg&öÒ'&V7BÖæF—fR#°Ğ¦–×÷'B²6fT&Vf–WrÒg&öÒ'&V7BÖæF—fR×6fRÖ&VÖ6öçFW‡B#°Ğ¦–×÷'B²W6Tfö7W4VffV7BÂW6U&÷WFW"Òg&öÒ&W‡ò×&÷WFW"#°Ğ¦–×÷'B²–öæ–6öç2Òg&öÒ$W‡ò÷fV7F÷"Ö–6öç2#°Ğ¦–×÷'B¢2†F–72g&öÒ&W‡òÖ†F–72#°Ğ¦–×÷'B¢2f–ÆU7—7FVÒg&öÒ&W‡òÖf–ÆR×7—7FVÒ#°Ğ¦–×÷'B²6ÖW&f–WrÂW6T6ÖW&W&Ö—76–öç2Òg&öÒ&W‡òÖ6ÖW&#°Ğ Ğ¦–×÷'B²F†VÖRÒg&öÒ$÷7&2÷F†VÖR#°Ğ¦–×÷'B²W6TWfVçFòÒg&öÒ$÷7&2ö7G‚öWfVçFò#°Ğ¦–×÷'B²W6U6W76–öâÒg&öÒ$÷7&2ö7G‚÷6W76–öâ#°Ğ¦–×÷'B²’Òg&öÒ$÷7&2÷WF–Ç2ö’#°Ğ¦–×÷'B²W‡G&7D6VGVÆÂ'6UFcCrÒg&öÒ$÷7&2÷WF–Ç2ö6VGVÆ#°Ğ¦–×÷'B²W'&÷$ÖW76vRÒg&öÒ$÷7&2÷WF–Ç2öW'&÷'2#°Ğ¦–×÷'B²æÆ—¦$6öävVÖ–æ’Òg&öÒ$÷7&2÷6W'f–6W2övVÖ–æ•6W'f–6R#°Ğ¦–×÷'B²Æö6Ä6VGVÆ6ÖW&ÂÆö6Å66ææW$f–Æ&ÆRÂG—RÆö6Ä6ÖW&&VbÒg&öÒ$÷7&2ö6ö×öæVçG2ôÆö6Ä6VGVÆ6ÖW&#°Ğ¦–×÷'B²—4×'¥FW‡BÒg&öÒ$÷7&2÷WF–Ç2ö×'¥fÆ–FF–öâ#°Ğ¦–×÷'B²×'¤–FVçF—G”6æF–FFRÒg&öÒ$÷7&2÷WF–Ç2ö×'¤–FVçF—G•&Wf–Wr#°Ğ¦–×÷'B²W6T×'¤–FVçF—G•&Wf–WrÒg&öÒ$÷7&2ö6ö×öæVçG2ô×'¤–FVçF—G•&Wf–Wr#°Ğ Ğ¦6öç7B”ÄÅõD”ÔTõUBÒ#S°Ğ¦6öç7B$uõ44åô4ôôÄDõtåôÕ2Ò“°Ğ¦6öç7B44ääU%õ$T$ÕôDTÄ•ôÕ2ÒCS°Ğ¦6öç7B%4ôÅUDUôd”ÄÂÒ²÷6—F–öã¢&'6öÇWFR"26öç7BÂF÷¢Â&–v‡C¢Â&÷GFöÓ¢ÂÆVgC¢Ó°Ğ¦6öç7B4ôÄôÔ$”åôD4…õ”ÄôEõ$RÒòƒó¥çÅµäÕ£Ó•Ò’…´Õ¥Ò’ÕÆG³RÃ‡ÒÕÆG³RÃÒÒ…´ÔeÒ’Ò…ÆG³RÃÒ’Ò‚ƒó£—Ã#•ÆG³gÒ’ƒó¥µãÓ•×ÂB’ö“°Ğ¦6öç7B%ô”Eô´U•õ$RÒòƒó¥çÅ³òb3²ÅÇ7µÅ²"uÒ•Ç2¢ƒó¦çV—Æ6VGVÆÆ5¶\:•ÖGVÆÆ67ÆFö7ÆFö7VÖVçF÷ÆFö7VÖVçEöçVÖ&W'ÆFö7VÖVçFçVÖ&W'ÆçVÖW&õöFö7VÖVçF÷Æ–FVçF–f–66–öçÆ–FVçF–f–66•¶ü;5Öâ•Ç2¥²"uÓõÇ2¥³£Òò2ÕÕÇ2¥²"uÓò…³Ó•Õ³Ó•Ç2âÂÕ×³2Ã#Õ³Ó•Ò’ö“°Ğ¦6öç7B%õ$Td•…õ$RÒòƒó¥çÅµäÕ£Ó•Ò’ƒó¤47ÄåT•ÄDô7Ä4TETÄÄDô5TÔTåDò•Ç2¥³¢2ÕÓõÇ2¢…³Ó•Õ³Ó•Ç2âÂÕ×³2Ã#Õ³Ó•Ò’ƒó¥µãÓ•×ÂB’ö“°Ğ Ğ§G—RFö7VÖVçE&Wf–WrÒ°Ğ¢6VGVÆ¢7G&–æs°Ğ¢æöÖ'&S¢7G&–æs°Ğ¢fV6†¢7G&–æs°Ğ¢fV6†W‡—&6–öãó¢7G&–æs°Ğ¢gVVçFSó¢7G&–æs°Ğ¢×'¥fÆ–Fóó¢&ööÆVã°Ğ¢GWÆ–6FSó¢&ööÆVã°Ğ¢&6U7FGW3ó¢7G&–æs°Ğ§Ó°Ğ Ğ§G—RÖöFRÒ&6ÖW&"Â&ÖçVÂ#°Ğ§G—R'6VD6VGVÆ&W7VÇBÒ&WGW&åG—SÇG—Vöb'6UFcCsã°Ğ§G—R6W'fW%'6VD6VGVÆÒ'F–ÃÅ–6³ÀĞ¢'6VD6VGVÆ&W7VÇBÀĞ¢Â&6VGVÆ Ğ¢Â&æöÖ'&W2 Ğ¢Â'&–ÖW%öVÆÆ–Fò Ğ¢Â'6VwVæFõöVÆÆ–Fò Ğ¢Â&vVæW&ò Ğ¢Â&fV6†öæ6–Ö–VçFò Ğ¢Â&fV6†öW‡—&6–öâ Ğ¢Â'F—õ÷6æw&R Ğ¢Â&×'¥÷fÆ–Fò Ğ£ãã°Ğ§G—Rö7%&VE&W7VÇBÒ²&s¢7G&–æs²6W'fW%'6VCó¢6W'fW%'6VD6VGVÆÓ°Ğ¦gVæ7F–öâ66ææVE–ÆöB‡&só¢7G&–ærÂçVÆÂÂFFó¢7G&–ærÂçVÆÂ“¢7G&–ær°Ğ¢f÷"†6öç7BfÇVRöb·&rÂFFÒ’°Ğ¢6öç7BFW‡BÒ7G&–ær‡fÇVRÇÂ""’çG&–Ò‚“°Ğ¢–b‡FW‡Bbbõâ†çVÆÇÇVæFVf–æVB’Bö’çFW7B‡FW‡B’’&WGW&âFW‡C°Ğ¢ĞĞ¢&WGW&â"#°Ğ§ĞĞ Ğ¦gVæ7F–öâ6fTFV6öFUU$”6ö×öæVçB‡fÇVS¢7G&–ær“¢7G&–ær°Ğ¢G'’°Ğ¢&WGW&âFV6öFUU$”6ö×öæVçB‡fÇVR“°Ğ¢Ò6F6‚°Ğ¢&WGW&âfÇVS°Ğ¢ĞĞ§ĞĞ Ğ¦gVæ7F–öâ6ÆVå$F–v—G2‡fÇVS¢7G&–ær“¢7G&–ær°Ğ¢6öç7BF–v—G2Ò7G&–ær‡fÇVRÇÂ""’ç&WÆ6R‚õÄBörÂ""’ç&WÆ6R‚õã²òÂ""“°Ğ¢–b‚õåÆG³RÃÒBòçFW7B†F–v—G2’’&WGW&â"#°Ğ¢–b‚õâƒ—Ã#•ÆG³'ÒBòçFW7B†F–v—G2’’&WGW&â"#°Ğ¢–b‚õâƒ—Ã#•ÆG³gÒBòçFW7B†F–v—G2’’&WGW&â"#°Ğ¢&WGW&âF–v—G3°Ğ§ĞĞ Ğ¦gVæ7F–öâ6ÆVä6VGVÆçVÖ&W"‡fÇVS¢7G&–ærÂçVÆÂÂVæFVf–æVB“¢7G&–ær°Ğ¢&WGW&â6ÆVå$F–v—G2…7G&–ær‡fÇVRÇÂ""’“°Ğ§ĞĞ Ğ¦gVæ7F–öâ'6VDgVÆÄæÖR‡'6VC¢'6VD6VGVÆ&W7VÇB“¢7G&–ær°Ğ¢&WGW&â°Ğ¢'6VBææöÖ'&W2ÀĞ¢'6VBç&–ÖW%öVÆÆ–FòÀĞ¢'6VBç6VwVæFõöVÆÆ–FòÀĞ¢Òæf–ÇFW"„&ööÆVâ’æ¦ö–â‚""’çG&–Ò‚“°Ğ§ĞĞ Ğ¦gVæ7F–öâW‡G&7E$6VGVÆ–ÆöB‡&s¢7G&–ær“¢7G&–ær°Ğ¢6öç7B÷&–v–æÂÒ7G&–ær‡&rÇÂ""’çG&–Ò‚“°Ğ¢–b‚÷&–v–æÂ’&WGW&â"#°Ğ Ğ¢6öç7Bf&–çG2Ò'&’æg&öÒ†æWr6WB…°Ğ¢÷&–v–æÂÀĞ¢6fTFV6öFUU$”6ö×öæVçB†÷&–v–æÂ’ÀĞ¢÷&–v–æÂç&WÆ6R‚òf×²öv’Â"b"’ÀĞ¢6fTFV6öFUU$”6ö×öæVçB†÷&–v–æÂç&WÆ6R‚òf×²öv’Â"b"’’ÀĞ¢Ò’’æf–ÇFW"„&ööÆVâ“°Ğ Ğ¢f÷"†6öç7BfÇVRöbf&–çG2’°Ğ¢–b‚õåÇ2¥ÆEµÆEÇ2âÂÕÒ¥Ç2¢BòçFW7B‡fÇVR’’°Ğ¢6öç7BF—&V7BÒ6ÆVå$F–v—G2‡fÇVR“°Ğ¢–b†F—&V7B’&WGW&âF—&V7C°Ğ¢ĞĞ Ğ¢6öç7B¶W”ÖF6‚ÒfÇVRæÖF6‚…%ô”Eô´U•õ$R“°Ğ¢–b†¶W”ÖF6‚’°Ğ¢6öç7BF–v—G2Ò6ÆVå$F–v—G2†¶W”ÖF6…³Ò“°Ğ¢–b†F–v—G2’&WGW&âF–v—G3°Ğ¢ĞĞ Ğ¢6öç7B&Vf—†VBÒfÇVRæÖF6‚…%õ$Td•…õ$R“°Ğ¢–b‡&Vf—†VB’°Ğ¢6öç7BF–v—G2Ò6ÆVå$F–v—G2‡&Vf—†VE³Ò“°Ğ¢–b†F–v—G2’&WGW&âF–v—G3°Ğ¢ĞĞ Ğ¢–b‚õåÇ2¥Ç²òçFW7B‡fÇVR’’°Ğ¢G'’°Ğ¢6öç7B§6öâÒ¥4ôâç'6R‡fÇVR“°Ğ¢6öç7Bf–æDÆ&VÆVD–BÒ†æöFS¢Væ¶æ÷vâ“¢7G&–ærÓâ°Ğ¢–b„'&’æ—4'&’†æöFR’’°Ğ¢f÷"†6öç7B6†–ÆBöbæöFR’°Ğ¢–b†6†–ÆBbbG—Vöb6†–ÆBÓÓÒ&ö&¦V7B"’°Ğ¢6öç7Bf÷VæBÒf–æDÆ&VÆVD–B†6†–ÆB“°Ğ¢–b†f÷VæB’&WGW&âf÷VæC°Ğ¢ĞĞ¢ĞĞ¢ÒVÇ6R–b†æöFRbbG—VöbæöFRÓÓÒ&ö&¦V7B"’°Ğ¢f÷"†6öç7B¶¶W’Â6†–ÆEÒöbö&¦V7BæVçG&–W2†æöFR2&V6÷&CÇ7G&–ærÂVæ¶æ÷vãâ’’°Ğ¢–b‚õâ†çV—Æ6VGVÆÆ5¶\:•ÖGVÆÆ67ÆFö7ÆFö7VÖVçF÷ÆFö7VÖVçEöçVÖ&W'ÆFö7VÖVçFçVÖ&W'ÆçVÖW&õöFö7VÖVçF÷Æ–FVçF–f–66–öçÆ–FVçF–f–66•¶ü;5Öâ’Bö’çFW7B†¶W’Ğ¢bb‡G—Vöb6†–ÆBÓÓÒ'7G&–ær"ÇÂG—Vöb6†–ÆBÓÓÒ&çVÖ&W""Ğ¢bbõåÇ2¥ÆEµÆEÇ2âÂÕÒ¥Ç2¢BòçFW7B…7G&–ær†6†–ÆB’’’°Ğ¢6öç7Bf÷VæBÒ6ÆVå$F–v—G2…7G&–ær†6†–ÆB’“°Ğ¢–b†f÷VæB’&WGW&âf÷VæC°Ğ¢ĞĞ¢–b†6†–ÆBbbG—Vöb6†–ÆBÓÓÒ&ö&¦V7B"’°Ğ¢6öç7Bf÷VæBÒf–æDÆ&VÆVD–B†6†–ÆB“°Ğ¢–b†f÷VæB’&WGW&âf÷VæC°Ğ¢ĞĞ¢ĞĞ¢ĞĞ¢&WGW&â"#°Ğ¢Ó°Ğ¢6öç7Bf÷VæBÒf–æDÆ&VÆVD–B†§6öâ“°Ğ¢–b†f÷VæB’&WGW&âf÷VæC°Ğ¢Ò6F6‚°Ğ¢òò–væ÷&RÖÆf÷&ÖVB"¥4ôàĞ¢ĞĞ¢ĞĞ¢ĞĞ Ğ¢&WGW&â"#°Ğ§ĞĞ Ğ¦gVæ7F–öâ—5&VÆ–&ÆT&&6öFR‡&s¢7G&–ærÂ7W'&VçDÖöFS¢ÖöFR“¢&ööÆVâ°Ğ¢–b‡'6UFcCr‡&r’æf÷&ÖFõöFWFV7FFóòç7F'G5v—F‚‚'FcCuö&–æ&–ò"’’&WGW&âG'VS°Ğ¢6öç7BfÇVRÒ7G&–ær‡&rÇÂ""’çG&–Ò‚“°Ğ¢–b‚fÇVR’&WGW&âfÇ6S°Ğ¢–b†7W'&VçDÖöFRÓÓÒ&ÖçVÂ"’&WGW&âG'VS°Ğ¢–b†W‡G&7E$6VGVÆ–ÆöB‡fÇVR’’&WGW&âG'VS°Ğ¢–b‚õåÆG³RÃÒBòçFW7B‡fÇVR’’&WGW&âG'VS°Ğ¢–b‚õ³òeÒ†çV—Æ6VGVÆÆ67ÆFö2•³Ó¥ÓõÆG³RÃÒö’çFW7B‡fÇVR’’&WGW&âG'VS°Ğ¢–b‚õâƒó¤47ÄåT•ÄDô7Ä4TETÄ•³¥Ç5ÓõÆG³RÃÒBö’çFW7B‡fÇVR’’&WGW&âG'VS°Ğ¢–b‡fÇVRæ–æ6ÇVFW2‚%V$E4µò"’ÇÂ‡fÇVRæ–æ6ÇVFW2‚%ÇS"’bbfÇVRæÆVæwF‚ãÒ#’’&WGW&âG'VS°Ğ¢6öç7B'6VBÒ'6UFcCr‡fÇVR“°Ğ¢–b‡'6VBæf÷&ÖFõöFWFV7FFóòç7F'G5v—F‚‚'FcCuö&–æ&–ò"’’&WGW&âG'VS°Ğ¢–b€Ğ¢7W'&VçDÖöFRÓÓÒ&6ÖW& Ğ¢bb'6VBæ6VGVÆĞ¢bb€Ğ¢fÇVRæ–æ6ÇVFW2‚$”D4ôÂ"Ğ¢ÇÂfÇVRæ–æ6ÇVFW2‚$”44ôÂ"Ğ¢ÇÂfÇVRæ–æ6ÇVFW2‚#ÃÂ"Ğ¢ÇÂfÇVRæ–æ6ÇVFW2‚'Â"Ğ¢ÇÂô5´\8•ÔETÄÄ47ÄåT•ÄDô5TÔTåD÷ÄåTÔU$÷Äì9¤ÔU$÷Ä”DTåD”d”2ö’çFW7B‡fÇVRĞ¢ÇÂ4ôÄôÔ$”åôD4…õ”ÄôEõ$RçFW7B‡fÇVRĞ¢Ğ¢’&WGW&âG'VS°Ğ¢–b‚õåÆG³RÃÒBòçFW7B‡fÇVR’’&WGW&âG'VS°Ğ¢–b‡fÇVRæ–æ6ÇVFW2‚$”D4ôÂ"’ÇÂfÇVRæ–æ6ÇVFW2‚$”CÄ4ôÂ"’ÇÂfÇVRæ–æ6ÇVFW2‚$”44ôÂ"’ÇÂfÇVRæ–æ6ÇVFW2‚$”3Ä4ôÂ"’’&WGW&âG'VS°Ğ¢–b„4ôÄôÔ$”åôD4…õ”ÄôEõ$RçFW7B‡fÇVR’’&WGW&âG'VS°Ğ¢–b‚õåÆG³RÃÕÇÂòçFW7B‡fÇVR’’&WGW&âG'VS°Ğ¢òòæò–æfW&—"VÂåT•FR"öf–6–ÆW26–g&F÷2ö÷6÷2àĞ¢–b‚õ³òeÒ†çV—Æ6VGVÆÆ67ÆFö2•³Ó¥ÓõÆG³RÃÒö’çFW7B‡fÇVR’’&WGW&âG'VS°Ğ¢òò"6öâ6öÆòì;¦ÖW&ò&V6VF–FòFR&Vf–¦ò†V¢â$43#3CScsƒ’"ò$åT•£#3CScsƒ’"Ğ¢–b‚õâƒó¤47ÄåT•ÄDô7Ä4TETÄ•³¥Ç5ÓõÆG³RÃÒBö’çFW7B‡fÇVR’’&WGW&âG'VS°Ğ¢&WGW&âfÇ6S°Ğ§ĞĞ Ğ¦gVæ7F–öâæ÷&ÖÆ—¦U$6VGVÆ–ÆöB‡&s¢7G&–ær“¢7G&–ær°Ğ¢òòF†—2†VÇW"Ç6ò&V6V—fW2DcCrâæWfW"æ÷&ÖÆ—¦R÷"G&–Ò—G2÷6—F–öæÂ'—FW22"FW‡BàĞ¢–b‡&ræ–æ6ÇVFW2‚%ÇS"’ÇÂ&ræ–æ6ÇVFW2‚%V$E4µò"Ğ¢ÇÂ'6UFcCr‡&r’æf÷&ÖFõöFWFV7FFóòç7F'G5v—F‚‚'FcCuö&–æ&–ò"’’&WGW&â&s°Ğ¢6öç7BfÇVRÒ7G&–ær‡&rÇÂ""’çG&–Ò‚“°Ğ¢6öç7BW‡G&7FVBÒW‡G&7E$6VGVÆ–ÆöB‡fÇVR“°Ğ¢–b†W‡G&7FVB’&WGW&âW‡G&7FVC°Ğ¢6öç7B%W&ÄÖF6‚ÒfÇVRæÖF6‚‚õ³òeÒƒó¦çV—Æ6VGVÆÆ67ÆFö2•³Ó¥Óò…ÆG³RÃÒ’ö’“°Ğ¢–b‡%W&ÄÖF6‚’&WGW&â%W&ÄÖF6…³Ó°Ğ Ğ¢6öç7B&Vf—†VDÖF6‚ÒfÇVRæÖF6‚‚õâƒó¤47ÄåT•ÄDô7Ä4TETÄ•³¥Ç5Óò…ÆG³RÃÒ’Bö’“°Ğ¢–b‡&Vf—†VDÖF6‚’&WGW&â&Vf—†VDÖF6…³Ó°Ğ Ğ¢&WGW&âfÇVS°Ğ§ĞĞ Ğ¦gVæ7F–öâW‡G&7D6VGVÆg&öÔ6ÖW&–ÆöB‡&s¢7G&–ærÂG—Só¢7G&–ær“¢7G&–ær°Ğ¢–b‚÷'ÆFFÖG&—‚ö’çFW7B…7G&–ær‡G—RÇÂ""’’’°Ğ¢&WGW&âW‡G&7E$6VGVÆ–ÆöB‡&r“°Ğ¢ĞĞ¢6öç7Bæ÷&ÖÆ—¦VBÒæ÷&ÖÆ—¦U$6VGVÆ–ÆöB‡&r“°Ğ¢6öç7B'6VBÒ'6UFcCr†æ÷&ÖÆ—¦VB“°Ğ¢&WGW&â6ÆVä6VGVÆçVÖ&W"‡'6VBæ6VGVÆÇÂW‡G&7D6VGVÆ†æ÷&ÖÆ—¦VB’ÇÂ""“°Ğ§ĞĞ Ğ¦W‡÷'BFVfVÇBgVæ7F–öâW66æV%67&VVâ‚’°Ğ¢6öç7B&÷WFW"ÒW6U&÷WFW"‚“°Ğ¢6öç7B²W6W"ÒÒW6U6W76–öâ‚“°Ğ¢6öç7BÖVÖ&W'6†—7F—fRÒW6W#òç7V'67&—F–öå÷7FGW2ÓÓÒ&–çFW&æÂ"ÇÀĞ¢‚‡W6W#òç7V'67&—F–öå÷7FGW2ÓÓÒ&7F—fR"ÇÂW6W#òç7V'67&—F–öå÷7FGW2ÓÓÒ'G&–Â"’b`Ğ¢W6W"æ7W'&VçE÷W&–öEöVæG5öBbbFFRç'6R‡W6W"æ7W'&VçE÷W&–öEöVæG5öB’âFFRææ÷r‚’“°Ğ¢6öç7B¶—4fö7W6VBÂ6WD—4fö7W6VEÒÒW6U7FFR†fÇ6R“°Ğ¢6öç7B¶6ÖW&&VG’Â6WD6ÖW&&VG•ÒÒW6U7FFR†fÇ6R“°Ğ¢6öç7B·F÷&6„Væ&ÆVBÂ6WEF÷&6„Væ&ÆVEÒÒW6U7FFR†fÇ6R“°Ğ¢6öç7B6ÖW&&VD'W7’ÒW6U&Vb†fÇ6R“°Ğ¢6öç7BÆö6Ä6ÖW&&VbÒW6U&VcÄÆö6Ä6ÖW&&VbÂçVÆÃâ†çVÆÂ“°Ğ¢6öç7B°Ğ¢WfVçFô–BÀĞ¢WfVçFôæöÖ'&RÀĞ¢&Vv—7G&÷2ÀĞ¢F÷FÅ&Vv—7G&÷2ÀĞ¢Ö—4W66æV÷2ÀĞ¢66âÀĞ¢w57FGW2ÀĞ¢7F—f÷2ÀĞ¢GWÆ–6F÷4&Æ÷VVF÷2ÀĞ¢VWVU6—¦RÀĞ¢6ÆV$WfVçFòÀĞ¢ÒÒW6TWfVçFò‚“°Ğ Ğ¢6öç7B¶ÖöFRÂ6WDÖöFUÒÒW6U7FFSÄÖöFSâ‚&6ÖW&"“°Ğ¢6öç7B¶6VGVÆ–çWBÂ6WD6VGVÆ–çWEÒÒW6U7FFR‚""“°Ğ¢6öç7B¶ö7$ÆöF–ærÂ6WDö7$ÆöF–æuÒÒW6U7FFR†fÇ6R“°Ğ¢6öç7B¶&&6öFTÆöF–ærÂ6WD&&6öFTÆöF–æuÒÒW6U7FFR†fÇ6R“°Ğ¢6öç7B¶Fö7VÖVçE&Wf–WrÂ6WDFö7VÖVçE&Wf–WuÒÒW6U7FFSÄFö7VÖVçE&Wf–WrÂçVÆÃâ†çVÆÂ“°Ğ¢6öç7B¶–ÆöF–ærÂ6WD–ÆöF–æuÒÒW6U7FFR†fÇ6R“°Ğ¢6öç7B·66ææW$Væ&ÆVBÂ6WE66ææW$Væ&ÆVEÒÒW6U7FFR‡G'VR“°Ğ¢6öç7B²&WVW7E&Wf–WrÂ6æ6VÅ&Wf–WrÂF–ÆörÒÒW6T×'¤–FVçF—G•&Wf–Wr‚“°Ğ¢6öç7B66ävVæW&F–öâÒW6U&Vbƒ“°Ğ¢W6TVffV7B‚‚’Óâ²66ävVæW&F–öâæ7W'&VçB²³²6æ6VÅ&Wf–Wr‚“²ÒÂ¶WfVçFô–BÂ—4fö7W6VBÂÖöFRÂ6æ6VÅ&Wf–WuÒ“°Ğ Ğ Ğ¢6öç7B·W&Ö—76–öâÂ&WVW7EW&Ö—76–öåÒÒW6T6ÖW&W&Ö—76–öç2‚“°Ğ¢6öç7B·Fö7BÂ6WEFö7EÒÒW6U7FFSÇ²¶–æC¢&ö²"Â&GW"Â&W'"#²FW‡C¢7G&–ærÒÂçVÆÃâ†çVÆÂ“°Ğ¢6öç7BÆ7E66å&VbÒW6U&VcÇ²fÇVS¢7G&–æs²C¢çVÖ&W"ÒÂçVÆÃâ†çVÆÂ“°Ğ¢6öç7BÆ7E&u66å&VbÒW6U&VcÇ²fÇVS¢7G&–æs²C¢çVÖ&W"ÒÂçVÆÃâ†çVÆÂ“°Ğ¢6öç7B66ä'W7•&VbÒW6U&Vb†fÇ6R“°Ğ¢6öç7B–ÆöF–æu&VbÒW6U&Vb†fÇ6R“°Ğ¢6öç7Bö7$ÆöF–æu&VbÒW6U&Vb†fÇ6R“°Ğ¢6öç7B&&6öFTÆöF–æu&VbÒW6U&Vb†fÇ6R“°Ğ¢6öç7BFö7EF–ÖW%&VbÒW6U&VcÅ&WGW&åG—SÇG—Vöb6WEF–ÖV÷WCâÂçVÆÃâ†çVÆÂ“°Ğ¢6öç7BFö7VÖVçE&Wf–WuF–ÖW%&VbÒW6U&VcÅ&WGW&åG—SÇG—Vöb6WEF–ÖV÷WCâÂçVÆÃâ†çVÆÂ“°Ğ¢6öç7B66ææW%&V&ÕF–ÖW%&VbÒW6U&VcÅ&WGW&åG—SÇG—Vöb6WEF–ÖV÷WCâÂçVÆÃâ†çVÆÂ“°Ğ¢6öç7BfÆ6„æ–ÒÒW6U&Vb†æWræ–ÖFVBåfÇVRƒ’’æ7W'&VçC°Ğ¢6öç7B66äÆ–æTæ–ÒÒW6U&Vb†æWræ–ÖFVBåfÇVRƒ’’æ7W'&VçC°Ğ¢6öç7B6ÖW&&VbÒW6U&VcÆç“â†çVÆÂ“°Ğ¢òòæG&ö–BW6Æö6Ä6VGVÆ6ÖW&„6ÖW&‚’ÂæòW‡ò6ÖW&f–WrâÆ2'WF–æ0Ğ¢òòFR6GW&FV&Vâ6WF"7VÇV–W&FRÆ2F÷2&VfW&Væ6–2àĞ¢6öç7B†46ÖW&ÒW6T6ÆÆ&6²‚‚’Óâ†Æö6Ä6ÖW&&Vbæ7W'&VçBÇÂ6ÖW&&Vbæ7W'&VçB’ÂµÒ“°Ğ¢6öç7B·&WF–6ÆT†V–v‡BÂ6WE&WF–6ÆT†V–v‡EÒÒW6U7FFRƒ“°Ğ Ğ¢W6Tfö7W4VffV7B‡W6T6ÆÆ&6²‚‚’Óâ°Ğ¢6WD—4fö7W6VB‡G'VR“°Ğ¢&WGW&â‚’Óâ6WD—4fö7W6VB†fÇ6R“°Ğ¢ÒÂµÒ’“°Ğ Ğ¢6öç7B6†÷uFö7BÒW6T6ÆÆ&6²‚†¶–æC¢&ö²"Â&GW"Â&W'""ÂFW‡C¢7G&–ær’Óâ°Ğ¢–b‡Fö7EF–ÖW%&Vbæ7W'&VçB’6ÆV%F–ÖV÷WB‡Fö7EF–ÖW%&Vbæ7W'&VçB“°Ğ¢6WEFö7B‡²¶–æBÂFW‡BÒ“°Ğ¢Fö7EF–ÖW%&Vbæ7W'&VçBÒ6WEF–ÖV÷WB‚‚’Óâ6WEFö7B†çVÆÂ’Â”ÄÅõD”ÔTõUB“°Ğ¢ÒÂµÒ“°Ğ Ğ¢6öç7BfÆ6„GWÆ–6FRÒW6T6ÆÆ&6²‚‚’Óâ°Ğ¢fÆ6„æ–Òç6WEfÇVRƒ“°Ğ¢æ–ÖFVBçF–Ö–ær†fÆ6„æ–ÒÂ²FõfÇVS¢ÂGW&F–öã¢cÂW6TæF—fTG&—fW#¢fÇ6RÒ’ç7F'B‚“°Ğ¢ÒÂ¶fÆ6„æ–ÕÒ“°Ğ Ğ¢6öç7B&V&Õ66ææW"ÒW6T6ÆÆ&6²‚†FVÆ’Ò44ääU%õ$T$ÕôDTÄ•ôÕ2’Óâ°Ğ¢–b‡66ææW%&V&ÕF–ÖW%&Vbæ7W'&VçB’6ÆV%F–ÖV÷WB‡66ææW%&V&ÕF–ÖW%&Vbæ7W'&VçB“°Ğ¢66ææW%&V&ÕF–ÖW%&Vbæ7W'&VçBÒ6WEF–ÖV÷WB‚‚’Óâ°Ğ¢66ææW%&V&ÕF–ÖW%&Vbæ7W'&VçBÒçVÆÃ°Ğ¢6WE66ææW$Væ&ÆVB‡G'VR“°Ğ¢ÒÂFVÆ’“°Ğ¢ÒÂµÒ“°Ğ Ğ¢W6TVffV7B‚‚’Óâ°Ğ¢&WGW&â‚’Óâ°Ğ¢–b‡Fö7EF–ÖW%&Vbæ7W'&VçB’6ÆV%F–ÖV÷WB‡Fö7EF–ÖW%&Vbæ7W'&VçB“°Ğ¢–b†Fö7VÖVçE&Wf–WuF–ÖW%&Vbæ7W'&VçB’6ÆV%F–ÖV÷WB†Fö7VÖVçE&Wf–WuF–ÖW%&Vbæ7W'&VçB“°Ğ¢–b‡66ææW%&V&ÕF–ÖW%&Vbæ7W'&VçB’6ÆV%F–ÖV÷WB‡66ææW%&V&ÕF–ÖW%&Vbæ7W'&VçB“°Ğ¢Ó°Ğ¢ÒÂµÒ“°Ğ Ğ¢W6TVffV7B‚‚’Óâ°Ğ¢6WE66ææW$Væ&ÆVB†ÖöFRÓÓÒ&6ÖW&"“°Ğ¢ÒÂ¶ÖöFUÒ“°Ğ Ğ¢6öç7B'V–ÆDFö7VÖVçE&Wf–WrÒW6T6ÆÆ&6²‚†6VGVÆ¢7G&–ærÂ'6VC¢&WGW&åG—SÇG—Vöb'6UFcCsâÂgVVçFSó¢7G&–ær“¢Fö7VÖVçE&Wf–WrÓâ°Ğ¢6öç7BæöÖ'&RÒ°Ğ¢'6VBææöÖ'&W2ÀĞ¢'6VBç&–ÖW%öVÆÆ–FòÀĞ¢'6VBç6VwVæFõöVÆÆ–FòÀĞ¢Òæf–ÇFW"„&ööÆVâ’æ¦ö–â‚""’çG&–Ò‚“°Ğ¢&WGW&â°Ğ¢6VGVÆÀĞ¢æöÖ'&RÀĞ¢fV6†¢'6VBæfV6†öæ6–Ö–VçFòÇÂ'6VBæfV6†öW‡—&6–öâÇÂ""ÀĞ¢fV6†W‡—&6–öã¢'6VBæfV6†öW‡—&6–öâÀĞ¢gVVçFRÀĞ¢×'¥fÆ–Fó¢'6VBæ×'¥÷fÆ–FòÀĞ¢Ó°Ğ¢ÒÂµÒ“°Ğ Ğ¢W6TVffV7B‚‚’Óâ°Ğ¢–b†ÖöFRÓÓÒ&6ÖW&"bbW&Ö—76–öãòæw&çFVBbbW&Ö—76–öãòæ6ä6´v–âÓÒfÇ6R’°Ğ¢&WVW7EW&Ö—76–öâ‚“°Ğ¢ĞĞ¢ÒÂ¶ÖöFRÂW&Ö—76–öâÂ&WVW7EW&Ö—76–öåÒ“°Ğ Ğ¢W6TVffV7B‚‚’Óâ°Ğ¢–b†ÖöFRÓÒ&6ÖW&"’°Ğ¢66äÆ–æTæ–Òç7F÷æ–ÖF–öâ‚“°Ğ¢66äÆ–æTæ–Òç6WEfÇVRƒ“°Ğ¢&WGW&ã°Ğ¢ĞĞ Ğ¢6öç7Bæ–ÖF–öâÒæ–ÖFVBæÆö÷€Ğ¢æ–ÖFVBç6WVVæ6R…°Ğ¢æ–ÖFVBçF–Ö–ær‡66äÆ–æTæ–ÒÂ²FõfÇVS¢ÂGW&F–öã¢ƒÂW6TæF—fTG&—fW#¢G'VRÒ’ÀĞ¢æ–ÖFVBçF–Ö–ær‡66äÆ–æTæ–ÒÂ²FõfÇVS¢ÂGW&F–öã¢ƒÂW6TæF—fTG&—fW#¢G'VRÒ’ÀĞ¢Ò’ÀĞ¢“°Ğ¢æ–ÖF–öâç7F'B‚“°Ğ¢&WGW&â‚’Óâæ–ÖF–öâç7F÷‚“°Ğ¢ÒÂ¶ÖöFRÂ66äÆ–æTæ–ÕÒ“°Ğ Ğ¢6öç7B6GW&T6ÖW&&6ScBÒW6T6ÆÆ&6²†7–æ2‡VÆ—G“¢çVÖ&W"Â6¶—&ö6W76–ærÒG'VR“¢&öÖ—6SÇ7G&–æsâÓâ°Ğ¢–b†Æö6Ä6ÖW&&Vbæ7W'&VçB’&WGW&âv—BÆö6Ä6ÖW&&Vbæ7W'&VçBæ6GW&R‚“°Ğ¢–b‚6ÖW&&Vbæ7W'&VçB’&WGW&â"#°Ğ¢–b‡G—Vöb6ÖW&&Vbæ7W'&VçBçF¶U†÷FòÓÓÒ&gVæ7F–öâ"’°Ğ¢6öç7B†÷FòÒv—B6ÖW&&Vbæ7W'&VçBçF¶U†÷Fò‡²fÆ6ƒ¢&öfb"Ò“°Ğ¢6öç7BF‚Ò†÷FóòçF‚ò7G&–ær‡†÷FòçF‚’¢"#°Ğ¢–b‚F‚’&WGW&â"#°Ğ¢6öç7BW&’ÒF‚ç7F'G5v—F‚‚&f–ÆS¢òò"’òF‚¢f–ÆS¢òòG·F‡Ö°Ğ¢&WGW&âf–ÆU7—7FVÒç&VD57G&–æt7–æ2‡W&’Â²Væ6öF–æs¢&&6ScB"Ò“°Ğ¢ĞĞ Ğ¢6öç7B†÷FòÒv—B6ÖW&&Vbæ7W'&VçBçF¶U–7GW&T7–æ2‡°Ğ¢VÆ—G’ÀĞ¢&6ScC¢G'VRÀĞ¢6¶—&ö6W76–ærÀĞ¢Ò“°Ğ¢&WGW&â†÷Fóòæ&6ScBÇÂ"#°Ğ¢ÒÂµÒ“°Ğ Ğ¢6öç7B&VD6ÖW&v—F„vVÖ–æ’ÒW6T6ÆÆ&6²†7–æ2†–ÖvT&6ScCó¢7G&–ær“¢&öÖ—6SÅ6W'fW%'6VD6VGVÆÂçVÆÃâÓâ°Ğ¢–b‚‚–ÖvT&6ScBbb†46ÖW&‚’’ÇÂ–ÆöF–æu&Vbæ7W'&VçB’&WGW&âçVÆÃ°Ğ¢–ÆöF–æu&Vbæ7W'&VçBÒG'VS°Ğ¢6WD–ÆöF–ær‡G'VR“°Ğ¢G'’°Ğ¢6öç7B#cBÒ–ÖvT&6ScBÇÂv—B6GW&T6ÖW&&6ScBƒãs‚ÂfÇ6R“°Ğ¢–b‚#cB’&WGW&âçVÆÃ°Ğ¢6öç7B–&W7VÇBÒv—BæÆ—¦$6öävVÖ–æ’†#cB“°Ğ¢&WGW&â–&W7VÇCòæ6VGVÆò–&W7VÇB¢çVÆÃ°Ğ¢Ò6F6‚°Ğ¢&WGW&âçVÆÃ°Ğ¢Òf–æÆÇ’°Ğ¢–ÆöF–æu&Vbæ7W'&VçBÒfÇ6S°Ğ¢6WD–ÆöF–ær†fÇ6R“°Ğ¢ĞĞ¢ÒÂ¶6GW&T6ÖW&&6ScBÂ†46ÖW&Ò“°Ğ Ğ¢6öç7B&VD6ÖW&v—F„ö7"ÒW6T6ÆÆ&6²†7–æ2†–ÖvT&6ScCó¢7G&–ær“¢&öÖ—6SÄö7%&VE&W7VÇCâÓâ°Ğ¢–b‚‚–ÖvT&6ScBbb†46ÖW&‚’’ÇÂö7$ÆöF–æu&Vbæ7W'&VçB’&WGW&â²&s¢""Ó°Ğ¢ö7$ÆöF–æu&Vbæ7W'&VçBÒG'VS°Ğ¢6WDö7$ÆöF–ær‡G'VR“°Ğ¢G'’°Ğ¢6öç7B#cBÒ–ÖvT&6ScBÇÂv—B6GW&T6ÖW&&6ScBƒãs"ÂfÇ6R“°Ğ¢–b‚#cB’&WGW&â²&s¢""Ó°Ğ¢6öç7B&W2Òv—B’æö7$6VGVÆ†#cB“°Ğ¢–b‡&W2æö²bb&W2æ6VGVÆ’°Ğ¢6öç7B&rÒ&W2æ6VGVÆ°Ğ¢6öç7B6W'fW%'6VBÒ²ââç&W2ç'6VBÂ6VGVÆ¢&W2æ6VGVÆÂ×'¥÷fÆ–Fó¢&W2æ×'¥÷fÆ–Fòóò&W2ç'6VCòæ×'¥÷fÆ–FòÓ°Ğ¢&WGW&â²&rÂ6W'fW%'6VBÓ°Ğ¢ĞĞ¢&WGW&â²&s¢""Ó°Ğ¢Ò6F6‚°Ğ¢&WGW&â²&s¢""Ó°Ğ¢Òf–æÆÇ’°Ğ¢ö7$ÆöF–æu&Vbæ7W'&VçBÒfÇ6S°Ğ¢6WDö7$ÆöF–ær†fÇ6R“°Ğ¢ĞĞ¢ÒÂ¶6GW&T6ÖW&&6ScBÂ†46ÖW&Ò“°Ğ Ğ¢6öç7B&VD6ÖW&&&6öFRÒW6T6ÆÆ&6²€Ğ¢7–æ2‡6–ÆVçBÒfÇ6RÂ–ÖvT&6ScCó¢7G&–ærÂ÷F–öç3¢²&VfW$×'£ó¢&ööÆVã²F–ÖV÷WD×3ó¢çVÖ&W"ÒÒ·Ò“¢&öÖ—6SÄö7%&VE&W7VÇCâÓâ°Ğ¢–b‚‚–ÖvT&6ScBbb†46ÖW&‚’’ÇÂ&&6öFTÆöF–æu&Vbæ7W'&VçB’&WGW&â²&s¢""Ó°Ğ¢&&6öFTÆöF–æu&Vbæ7W'&VçBÒG'VS°Ğ¢6WD&&6öFTÆöF–ær‡G'VR“°Ğ¢G'’°Ğ¢6öç7B#cBÒ–ÖvT&6ScBÇÂv—B6GW&T6ÖW&&6ScB†÷F–öç2ç&VfW$×'¢òãs‚¢ãc‚“°Ğ¢–b‚#cB’&WGW&â²&s¢""Ó°Ğ¢6öç7B&W2Òv—B’æ&&6öFT6VGVÆ†#cBÂ²&VfW$×'£¢÷F–öç2ç&VfW$×'¢ÂF–ÖV÷WD×3¢÷F–öç2çF–ÖV÷WD×2Ò“°Ğ¢–b‡&W2æö²bb&W2æ6VGVÆ’°Ğ¢6öç7B&rÒ&W2æ6VGVÆ°Ğ¢6öç7B6W'fW%'6VBÒ²ââç&W2ç'6VBÂ6VGVÆ¢&W2æ6VGVÆÂ×'¥÷fÆ–Fó¢&W2æ×'¥÷fÆ–Fòóò&W2ç'6VCòæ×'¥÷fÆ–FòÓ°Ğ¢&WGW&â²&rÂ6W'fW%'6VBÓ°Ğ¢ĞĞ¢&WGW&â²&s¢""Ó°Ğ¢Ò6F6‚†S¢ç’’°Ğ¢–b‚6–ÆVçB’6†÷uFö7B‚&W'""ÂW'&÷$ÖW76vR†RÂ$W'&÷"ÆW–VæFò&'&2"’“°Ğ¢&WGW&â²&s¢""Ó°Ğ¢Òf–æÆÇ’°Ğ¢&&6öFTÆöF–æu&Vbæ7W'&VçBÒfÇ6S°Ğ¢6WD&&6öFTÆöF–ær†fÇ6R“°Ğ¢ĞĞ¢ÒÀĞ¢¶6GW&T6ÖW&&6ScBÂ†46ÖW&Â6†÷uFö7EÒÀĞ¢“°Ğ Ğ¢6öç7B†æFÆU66âÒW6T6ÆÆ&6²€Ğ¢7–æ2‡&s¢7G&–ærÂ÷F–öç3¢²6¶—&&6öFTfÆÆ&6³ó¢&ööÆVã²6W'fW%'6VCó¢6W'fW%'6VD6VGVÆÒÒ·Ò“¢&öÖ—6SÆ&ööÆVãâÓâ°Ğ¢–b‚ÖVÖ&W'6†—7F—fR’°Ğ¢6†÷uFö7B‚&W'""Â$ÆÖVÖ'&W<:ÖFRW7FV×&W6æòW7L:7F—fâ6öçF7F¤Ò6W'f–6UFV2â"“°Ğ¢&WGW&âfÇ6S°Ğ¢ĞĞ¢–b‡66ä'W7•&Vbæ7W'&VçB’&WGW&âfÇ6S°Ğ¢6öç7BF–6¶WBÒ66ävVæW&F–öâæ7W'&VçC°Ğ¢6öç7B7W'&VçBÒ‚’ÓâF–6¶WBÓÓÒ66ävVæW&F–öâæ7W'&VçBbb7FFRæ7W'&VçE7FFRÓÓÒv7F—fRs°Ğ¢66ä'W7•&Vbæ7W'&VçBÒG'VS°Ğ¢6WE66ææW$Væ&ÆVB†fÇ6R“°Ğ¢G'’°Ğ¢6öç7B6æF–FFRÒ×'¤–FVçF—G”6æF–FFR‡&r“°Ğ¢–b†—4×'¥FW‡B‡&r’bb6æF–FFR’°Ğ¢6†÷uFö7B‚&W'""Â$Õ%¢–æ6ö×ÆWFò6öâ6öçG&öÆW2–æ6÷'&V7F÷2âgVVÇfRÆVW&Æâ"“°Ğ¢&WGW&âfÇ6S°Ğ¢ĞĞ¢6öç7B&–æ'’Ò&ræ–æ6ÇVFW2‚uÇSr’ÇÂ&ræ–æ6ÇVFW2‚uV$E4µòr“°Ğ¢ÆWB&uFõW6RÒ6æF–FFRÇÂ&–æ'’ò&r¢æ÷&ÖÆ—¦U$6VGVÆ–ÆöB‡&r“°Ğ¢ÆWB&Wf–WvVDæÖS¢7G&–ærÂVæFVf–æVC°Ğ¢ÆWB–æ†W&—FVE6W'fW%'6VBÒ÷F–öç2ç6W'fW%'6VC°Ğ¢6öç7B†56W'fW%'6VBÒ‚’Óâ–æ†W&—FVE6W'fW%'6VBbbö&¦V7Bæ¶W—2†–æ†W&—FVE6W'fW%'6VB’æÆVæwF‚â°Ğ¢6öç7B6åW6U6W'fW%'6VBÒ‚’Óâ†56W'fW%'6VB‚’bb6ÆVä6VGVÆçVÖ&W"†–æ†W&—FVE6W'fW%'6VCòæ6VGVÆ“°Ğ¢6öç7B'V–ÆE'6VBÒ‚“¢'6VD6VGVÆ&W7VÇBÓâ6æF–FFRò'6UFcCr‡&uFõW6R’¢6åW6U6W'fW%'6VB‚Ğ¢ò°Ğ¢6VGVÆ¢–æ†W&—FVE6W'fW%'6VCòæ6VGVÆÇÂ""ÀĞ¢æöÖ'&W3¢–æ†W&—FVE6W'fW%'6VCòææöÖ'&W2ÇÂ""ÀĞ¢&–ÖW%öVÆÆ–Fó¢–æ†W&—FVE6W'fW%'6VCòç&–ÖW%öVÆÆ–FòÇÂ""ÀĞ¢6VwVæFõöVÆÆ–Fó¢–æ†W&—FVE6W'fW%'6VCòç6VwVæFõöVÆÆ–FòÇÂ""ÀĞ¢vVæW&ó¢–æ†W&—FVE6W'fW%'6VCòævVæW&òÇÂ""ÀĞ¢fV6†öæ6–Ö–VçFó¢–æ†W&—FVE6W'fW%'6VCòæfV6†öæ6–Ö–VçFòÇÂ""ÀĞ¢fV6†öW‡—&6–öã¢–æ†W&—FVE6W'fW%'6VCòæfV6†öW‡—&6–öâÇÂ""ÀĞ¢F—õ÷6æw&S¢–æ†W&—FVE6W'fW%'6VCòçF—õ÷6æw&RÇÂ""ÀĞ¢f÷&ÖFõöFWFV7FFó¢&ö7%÷6W'f–F÷""ÀĞ¢×'¥÷fÆ–Fó¢–æ†W&—FVE6W'fW%'6VCòæ×'¥÷fÆ–FòÀĞ¢&uö×'£¢µÒÀĞ¢&s¢&uFõW6RÀĞ¢ĞĞ¢¢'6UFcCr‡&uFõW6R“°Ğ¢òòfÆÆ&6²&VÂ&f÷F÷2ö<;6F–v÷2–æ6ö×ÆWF÷2âÆfW'6œ;6âçFW&–÷ Ğ¢òòFVì:ÖW7F'WF7F—f²FV¦&ÆVâfÇ6V†<:ÖVRVæf÷FòçVæ6Ğ¢òòÆÆVv&ÂÆV7F÷"FRDcCrôÕ%¢FVÂ&6¶VæBàĞ¢6öç7BG'”–ÖvTfÆÆ&6²Ò7–æ2‡7F'DÖW76vS¢7G&–ær“¢&öÖ—6SÆ&ööÆVãâÓâ°Ğ¢–b†ÖöFRÓÒ&6ÖW&"ÇÂ÷F–öç2ç6¶—&&6öFTfÆÆ&6²’&WGW&âfÇ6S°Ğ¢6†÷uFö7B‚&W'""Â7F'DÖW76vR“°Ğ¢6öç7B–ÖvT&6ScBÒv—B6GW&T6ÖW&&6ScBƒãs‚ÂfÇ6R“°Ğ¢–b‚–ÖvT&6ScB’&WGW&âfÇ6S°Ğ¢6öç7B&V6÷fW&VBÒv—B&VD6ÖW&&&6öFR‡G'VRÂ–ÖvT&6ScBÂ²&VfW$×'£¢G'VRÂF–ÖV÷WD×3¢“Ò“°Ğ¢–b‚&V6÷fW&VBç&rbb&V6÷fW&VBç6W'fW%'6VCòæ6VGVÆ’&WGW&âfÇ6S°Ğ¢&uFõW6RÒ&V6÷fW&VBç&ròæ÷&ÖÆ—¦U$6VGVÆ–ÆöB‡&V6÷fW&VBç&r’¢&uFõW6S°Ğ¢–æ†W&—FVE6W'fW%'6VBÒ&V6÷fW&VBç6W'fW%'6VC°Ğ¢&WGW&âG'VS°Ğ¢Ó°Ğ¢–b‚6åW6U6W'fW%'6VB‚’bb—5&VÆ–&ÆT&&6öFR‡&uFõW6RÂÖöFR’’°Ğ¢–b†ÖöFRÓÓÒ&6ÖW&"’°Ğ¢6öç7B&V6÷fW&VBÒv—BG'”–ÖvTfÆÆ&6²‚$6öF–vò–æ6ö×ÆWFòâ–çFVçFæFò6öâ”âââ"“°Ğ¢–b‚&V6÷fW&VB’°Ğ¢v—B†F–72ææ÷F–f–6F–öä7–æ2„†F–72äæ÷F–f–6F–öäfVVF&6µG—Råv&æ–ær“°Ğ¢6†÷uFö7B‚&W'""Â$æòVFRÆVW&ÆâÆ–æVÆ6VGVÆ6ö×ÆWF’Wf—F&VfÆV¦÷2â"“°Ğ¢&WGW&âfÇ6S°Ğ¢ĞĞ¢ÒVÇ6R°Ğ¢v—B†F–72ææ÷F–f–6F–öä7–æ2„†F–72äæ÷F–f–6F–öäfVVF&6µG—Råv&æ–ær“°Ğ¢6†÷uFö7B‚&W'""Â$æòVFR6öæf—&Ö"Æ<:–GVÆâ"“°Ğ¢&WGW&âfÇ6S°Ğ¢ĞĞ¢ĞĞ Ğ¢ÆWB'6VBÒ'V–ÆE'6VB‚“°Ğ¢ÆWB6VGVÆÒ6ÆVä6VGVÆçVÖ&W"‡'6VBæ6VGVÆÇÂW‡G&7D6VGVÆ‡&uFõW6R’ÇÂ""“°Ğ¢–b‚6VGVÆbbÖöFRÓÓÒ&6ÖW&"’°Ğ¢6öç7B&V6÷fW&VBÒv—BG'”–ÖvTfÆÆ&6²‚$6öF–vò6–âåT•â–çFVçFæFò6öâ”âââ"“°Ğ¢–b‡&V6÷fW&VB’°Ğ¢'6VBÒ'V–ÆE'6VB‚“°Ğ¢6VGVÆÒ6ÆVä6VGVÆçVÖ&W"‡'6VBæ6VGVÆÇÂW‡G&7D6VGVÆ‡&uFõW6R’ÇÂ""“°Ğ¢ĞĞ¢ĞĞ¢–b‚6VGVÆ’°Ğ¢6†÷uFö7B‚&W'""Â$æòVFR6öæf—&Ö"Æ<:–GVÆâW6Æ6Ö&6ö×ÆWFòÖçVÂâ"“°Ğ¢&WGW&âfÇ6S°Ğ¢ĞĞ¢–b†6æF–FFR’°Ğ¢6öç7B6öæf—&ÖVBÒv—B&WVW7E&Wf–Wr†6æF–FFR“°Ğ¢–b‚6öæf—&ÖVBÇÂ7W'&VçB‚’’&WGW&âfÇ6S°Ğ¢6öç7B–FVçF—G”6†ævVBÒ6öæf—&ÖVBæ6VGVÆÓÒ6VGVÆ°Ğ¢6VGVÆÒ6öæf—&ÖVBæ6VGVÆ²&Wf–WvVDæÖRÒ6öæf—&ÖVBææöÖ'&S°Ğ¢'6VBÒ²ââç'6VBÂ6VGVÆÂæöÖ'&W3¢6öæf—&ÖVBææöÖ'&RÂ&–ÖW%öVÆÆ–Fó¢""Â6VwVæFõöVÆÆ–Fó¢""ÀĞ¢×'¥÷fÆ–Fó¢–FVçF—G”6†ævVBòfÇ6R¢'6VBæ×'¥÷fÆ–FòÂf÷&ÖFõöFWFV7FFó¢$Õ%¢&Wf—6F"ÀĞ¢âââ†–FVçF—G”6†ævVBò²fV6†öæ6–Ö–VçFó¢""ÂfV6†öW‡—&6–öã¢""ÂvVæW&ó¢""Ò¢·Ò’Ó°Ğ¢ĞĞ¢–b‚7W'&VçB‚’’&WGW&âfÇ6S°Ğ¢6öç7Bæ÷rÒFFRææ÷r‚“°Ğ¢–b†Æ7E66å&Vbæ7W'&VçBbbÆ7E66å&]ôã«h‘éì¶»§q«^tšY]Èİ[O^Üİ[\Ë˜Ø[Y\˜UÜ˜\H\İQHœØØ[›™\‹XØ[Y\˜K]šY]ÈƒBˆÈ\\›Z\ÜÚ[ÛˆÈ
+BˆšY]Èİ[O^Üİ[\Ë˜Ø[TXÙZÛ\ŸO^İ[O^Üİ[\Ëœ\›U^O’[šXÚX[™Èğè[X\˜K‹‹Õ^ÕšY]ÏƒBˆ
+Hˆ\\›Z\ÜÚ[Û‹™Ü˜[YÈ
+BˆšY]Èİ[O^Üİ[\Ë˜Ø[TXÙZÛ\ŸOƒBˆ[ÛšXÛÛœÈ˜[YOH˜Ø[Y\˜K[İ][™HˆÚ^™O^ÍMŸHÛÛÜ^İ[YK^ÙXÛÛ™\_HÏƒBˆ^İ[O^Üİ[\Ëœ\›U]_OXØÙ\ÛÈHHğè[X\˜OÕ^ƒBˆ^İ[O^Üİ[\Ëœ\›U^O”\˜HY\ˆMËT‹T–ˆÈ[Y\›È[\™\ÛËÕ^ƒBˆİXÚX›SÜXÚ]H\İQH™Ü˜[XØ[Y\˜K\\›Z\ÜÚ[Ûˆˆİ[O^Üİ[\Ëœš[X\PŸHÛ”™\ÜÏ^Ê
+HOˆ™\]Y\İ\›Z\ÜÚ[ÛŠ
+_OƒBˆ^İ[O^Üİ[\Ëœš[X\P•^O“İÜ™Ø\ˆ\›Z\ÛÏÕ^ƒBˆÕİXÚX›SÜXÚ]OƒBˆÕšY]ÏƒBˆ
+Hˆ
+BˆƒBˆÔ]›Ü›K“ÔÈOOH˜[™›ÚYˆ	‰ˆØØ[ØØ[›™\]˜Z[X›HÈ
+BˆØØ[ÙY[PØ[Y\˜CBˆ™Y^ÛØØ[Ø[Y\˜T™YŸCBˆİ[O^ĞP”ÓÓUWÑ’SCBˆXİ]™O^Ú\Ñ›Øİ\ÙY	‰ˆØØ[›™\‘[˜X›YCBˆÜ˜Ú^İÜ˜Ú[˜X›YCBˆÛ•Ü˜ÚÚ[™ÙO^ÜÙ]Ü˜Ú[˜X›YCBˆÛ“\^Ê˜]ÊHOˆØ[Y\˜T™XY\ŞK˜İ\œ™[È›ÛZ\ÙKœ™\ÛÛ™J˜[ÙJHˆ[™TØØ[Š˜]ËÈÚÚ\˜\˜ÛÙQ˜[˜XÚÎˆYHJ_CBˆÛ˜\˜ÛÙO^Ê˜]Ë\JHOˆÃBˆYˆ
+\˜]ÈØØ[\ŞT™Y‹˜İ\œ™[Ø[Y\˜T™XY\ŞK˜İ\œ™[
+H™]\›ˆ˜[ÙNÃBˆYˆ
+Y^˜XİÙY[Qœ›ÛPØ[Y\˜T^[ØY
+˜]Ë\JJHÃBˆYˆ
+\HOOHœMÈˆ	‰ˆ
+[\İ˜]ÔØØ[”™Y‹˜İ\œ™[]K››İÊ
+HH\İ˜]ÔØØ[”™Y‹˜İ\œ™[˜]ˆL
+JHÃBˆ\İ˜]ÔØØ[”™Y‹˜İ\œ™[HÈ˜[YNˆ˜]Ë]ˆ]K››İÊ
+HNÃBˆÚİÕØ\İ
+™\œˆ‹”MÈ]XİYË\›ÈİHÛÛ[šYÈ›ÈÙHYÈ[\œ™]\‹ˆ›ÈÙHİX\™0ìÈ[˜HğêY[Hİ\Y\İKˆŠNÃBˆCBˆ™]\›ˆ˜[ÙNÃBˆCBˆ›ÚY[™TØØ[Š˜]ËÈÚÚ\˜\˜ÛÙQ˜[˜XÚÎˆYHJNÃBˆ™]\›ˆYNÃBˆ_CBˆƒBˆšY]ÈÚ[\‘]™[ÏH››Û™Hˆİ[O^Üİ[\Ëœ™]XÛSİ™\›^_OƒBˆšY]Èİ[O^ÖÜİ[\Ëœ™]XÛKİ[\Ë˜˜XÚÔ™]XÛW_OƒBˆšY]Èİ[O^ÖÜİ[\Ëœ™]XÛPÛÜ›™\‹İ[\Ëœ™]XÛPÛÜ›™\•ÜY_HÏšY]Èİ[O^ÖÜİ[\Ëœ™]XÛPÛÜ›™\‹İ[\Ëœ™]XÛPÛÜ›™\•ÜšYÚ_HÏƒBˆšY]Èİ[O^ÖÜİ[\Ëœ™]XÛPÛÜ›™\‹İ[\Ëœ™]XÛPÛÜ›™\›İÛSY_HÏšY]Èİ[O^ÖÜİ[\Ëœ™]XÛPÛÜ›™\‹İ[\Ëœ™]XÛPÛÜ›™\›İÛTšYÚ_HÏƒBˆÕšY]ÏƒBˆÕšY]ÏƒBˆÓØØ[ÙY[PØ[Y\˜OƒBˆ
+Hˆ
+BˆØ[Y\˜UšY]ÃBˆ™Y^ØØ[Y\˜T™YŸCBˆÛØ[Y\˜T™XYO^Ê
+HOˆÙ]Ø[Y\˜T™XYJYJ_CBˆİ[O^ĞP”ÓÓUWÑ’SCBˆ[˜X›UÜ˜Ú^İÜ˜Ú[˜X›YCBˆ˜XÚ[™ÏH˜˜XÚÈƒBˆ]]Ù›Øİ\ÏH›ÛˆƒBˆ˜\˜ÛÙTØØ[›™\”Ù][™ÜÏ^ŞÃBˆ˜\˜ÛÙU\\ÎˆÈœMÈ‹œ\ˆ‹™][X]š^—KBˆ_CBˆÛ˜\˜ÛÙTØØ[›™Y^ÜØØ[›™\‘[˜X›YÈ
+È˜]Ë]K\HJHOˆÃBˆÛÛœİ^[ØYHØØ[›™Y^[ØY
+˜]Ë]JNÃBˆYˆ
+\^[ØY
+H™]\›ÃBˆÛÛœİ›Ü›X[^™YH›Ü›X[^™T\ÙY[T^[ØY
+^[ØY
+NÃBˆÛÛœİ›İÈH]K››İÊ
+NÃBˆYˆ
+Bˆ\İ˜]ÔØØ[”™Y‹˜İ\œ™[Bˆ	‰ˆ\İ˜]ÔØØ[”™Y‹˜İ\œ™[˜[YHOOH›Ü›X[^™YBˆ	‰ˆ›İÈH\İ˜]ÔØØ[”™Y‹˜İ\œ™[˜]U×ÔĞĞS—ĞÓÓÓÕÓ—ÓTÃBˆ
+HÃBˆ™]\›ÃBˆCBˆ\İ˜]ÔØØ[”™Y‹˜İ\œ™[HÈ˜[YNˆ›Ü›X[^™Y]ˆ›İÈNÃBˆÛÛœİ\Ñ\™XİÙY[HHHY^˜XİÙY[Qœ›ÛPØ[Y\˜T^[ØY
+›Ü›X[^™Y\JNÃBˆYˆ
+Z\Ñ\™XİÙY[JHÃBˆYˆ
+\HOOHœ\ˆŠHÃBˆÚİÕØ\İ
+™\œˆ‹”TˆÚYœ˜YÈÈ›ÈÛÛ\]X›Kˆ›ÈÙHY]š[˜HHğêY[Nˆ\ØHT–ˆÈ™YÚ\İ›ÈX[X[ˆŠNÃBˆCBˆ™]\›ÃBˆCBˆ›ÚY[™TØØ[Š›Ü›X[^™YÈÚÚ\˜\˜ÛÙQ˜[˜XÚÎˆYHJNÃBˆHˆ[™Yš[™YOƒBˆšY]Èİ[O^Üİ[\Ëœ™]XÛSİ™\›^_HÚ[\‘]™[ÏH››Û™HƒBˆšY]ÃBˆİ[O^ÖÜİ[\Ëœ™]XÛKİ[\Ë˜˜XÚÔ™]XÛW_CBˆÛ“^[İ]^ÊÈ˜]]™Q]™[JHOˆÙ]™]XÛRZYÚ
+˜]]™Q]™[›^[İ]šZYÚ
+_CBˆƒBˆ[š[X]Y•šY]Èİ[O^ÖÜİ[\ËœØØ[“[™KÈ˜[œÙ›Ü›NˆŞÈ˜[œÛ]VNˆØØ[“[™U˜[œÛ]VHWHW_HÏƒBˆšY]Èİ[O^ÖÜİ[\Ëœ™]XÛPÛÜ›™\‹İ[\Ëœ™]XÛPÛÜ›™\•ÜY_HÏƒBˆšY]Èİ[O^ÖÜİ[\Ëœ™]XÛPÛÜ›™\‹İ[\Ëœ™]XÛPÛÜ›™\•ÜšYÚ_HÏƒBˆšY]Èİ[O^ÖÜİ[\Ëœ™]XÛPÛÜ›™\‹İ[\Ëœ™]XÛPÛÜ›™\›İÛSY_HÏƒBˆšY]Èİ[O^ÖÜİ[\Ëœ™]XÛPÛÜ›™\‹İ[\Ëœ™]XÛPÛÜ›™\›İÛTšYÚ_HÏƒBˆÕšY]ÏƒBˆÕšY]ÏƒBˆĞØ[Y\˜UšY]ÏƒBˆ
+_CBˆÏƒBˆ
+_CBˆÜ\›Z\ÜÚ[ÛË™Ü˜[Y	‰ˆ[ØØ[ØØ[›™\]˜Z[X›H	‰ˆšY]ÈÚ[\‘]™[ÏH››Û™Hˆİ[O^Üİ[\Ë˜Ø[Y\˜R[œİXİ[ÛœßOƒBˆ[ÛšXÛÛœÈ˜[YOHœØØ[ˆˆÚ^™O^ÌŒŸHÛÛÜHˆÌŒ‘HˆÏƒBˆšY]Èİ[O^Üİ[\Ë˜Ø[Y\˜R[œİXİ[ÛœÕ^OƒBˆ^İ[O^Üİ[\Ë˜Ø[Y\˜R[œİXİ[ÛœÕ]_O[[™XHHğêY[H[›È[X\˜ÛÏÕ^ƒBˆ^İ[O^Üİ[\Ë˜Ø[Y\˜R[œİXİ[ÛœÑ]Z[OXÙ\˜ØH[Øİ[Y[Ë]š]H™Y›Z›ÜÈHX[0ê[›È]ZY]ËÕ^ƒBˆÕšY]ÏƒBˆÕšY]ÏŸCBˆšY]Èİ[O^Üİ[\Ë˜Ø[Y\˜P›İÛPÛÛ›ÛßOƒBˆİXÚX›SÜXÚ]Hİ[O^Üİ[\Ë˜Ø[Y\˜TÚYPÛÛ›ÛHÛ”™\ÜÏ^Ê
+HOˆÙ][ÙJ›X[X[Š_HXØÙ\ÜÚXš[]SX™[H’[™Ü™\ÛÈX[X[[ÛšXÛÛœÈ˜[YOHšÙ^\Y[İ][™HˆÚ^™O^ÌHÛÛÜHˆÙ™™ˆˆÏ^İ[O^Üİ[\Ë˜Ø[Y\˜PÛÛ›ÛX™[O“X[X[Õ^ÕİXÚX›SÜXÚ]OƒBˆšY]Èİ[O^Üİ[\Ë˜Ø[Y\˜T™XYÛÛ›ÛOƒBˆİXÚX›SÜXÚ]H\İQH™XÛÙK\MË\İËXˆˆİ[O^ÖÜİ[\ËœÚ]\]Û‹
+˜\˜ÛÙSØY[™ÈØÜ“ØY[™ÈXSØY[™ÊH	‰ˆÈÜXÚ]NˆˆW_HÛ”™\ÜÏ^ØØ\\™P[™XÛÙP˜\˜ÛÙ_H\ØX›Y^Ø˜\˜ÛÙSØY[™ÈØÜ“ØY[™ÈXSØY[™ßHXØÙ\ÜÚXš[]SX™[H“Y\ˆØİ[Y[ÈƒBˆØ˜\˜ÛÙSØY[™ÈØÜ“ØY[™ÈXSØY[™ÈÈXİ]š]R[™XØ]ÜˆÛÛÜ^İ[YK˜œ˜[™HÏˆˆ[ÛšXÛÛœÈ˜[YOHœØØ[‹[İ][™HˆÚ^™O^ÌÌHÛÛÜ^İ[YK˜œ˜[™HÏŸCBˆÕİXÚX›SÜXÚ]OƒBˆ^İ[O^Üİ[\Ë˜Ø[Y\˜PÛÛ›ÛX™[OØ˜\˜ÛÙSØY[™ÈØÜ“ØY[™ÈXSØY[™ÈÈ“^Y[™ø )ˆˆˆ“Y\ˆZÜ˜HŸOÕ^ƒBˆÕšY]ÏƒBˆšY]È\İQHœØØ[‹XÛİ[\ˆˆXØÙ\ÜÚXš[]SX™[^Ø\È\ØØ[™[ÜÎˆ	ÛZ\Ñ\ØØ[™[ÜßXHİ[O^Üİ[\Ë˜Ø[Y\˜PÛİ[\˜YÙ_OƒBˆ^İ[O^Üİ[\Ë˜Ø[Y\˜PÛİ[\•˜[Y_OÛZ\Ñ\ØØ[™[ÜßOÕ^ƒBˆ^İ[O^Üİ[\Ë˜Ø[Y\˜PÛİ[\“X™[O•TÈ‘QÒTÕ“ÔÏÕ^ƒBˆÕšY]ÏƒBˆÕšY]ÏƒBˆÕšY]ÏƒBˆ
+Hˆ
+BˆÙ^X›Ø\™]›ÚY[™ÕšY]È™Z]š[Ü^Ô]›Ü›K“ÔÈOOHš[ÜÈˆÈœY[™Èˆˆ[™Yš[™YHİ[O^ŞÈ›^ˆH_OƒBˆØÜ›ÛšY]ÈÛÛ[ÛÛZ[™\”İ[O^Üİ[\Ë›X[X[ØÜ›ÛHÙ^X›Ø\™Úİ[\œÚ\İ\ÏHš[™YƒBˆšY]Èİ[O^Üİ[\Ë›X[X[Ø\™OƒBˆ^İ[O^Üİ[\Ë›X[X[X™[OğêY[OÕ^ƒBˆ^[œ]Bˆ\İQH›X[X[XÙY[KZ[œ]ƒBˆİ[O^ÖÜİ[\Ë›X[X[[œ]È›ÛÚ^™Nˆ›ÛÙZYÚˆL‹]\”ÜXÚ[™Îˆ‹^[YÛˆ˜Ù[\ˆˆW_CBˆ˜[YO^ØÙY[R[œ]CBˆÛÚ[™ÙU^^Ê
+HOˆÙ]ÙY[R[œ]
+œ™\XÙJ×ÙËˆŠJ_CBˆXÙZÛ\HŒLŒÍMÎHƒBˆXÙZÛ\•^ÛÛÜ^İ[YK^\ØX›YCBˆÙ^X›Ø\™\OH›[X™\‹\YƒBˆ]]Ñ›Øİ\ÃBˆX^[™İ^ÌL_CBˆÏƒBƒBˆİXÚX›SÜXÚ]H\İQH›X[X[\İX›Z]X]Ûˆˆİ[O^Üİ[\ËœİX›Z]ŸHÛ”™\ÜÏ^ÛÛ“X[X[İX›Z]OƒBˆ[ÛšXÛÛœÈ˜[YOH˜ÚXÚÛX\šËXÚ\˜ÛHˆÚ^™O^ÌŒŸHÛÛÜHˆÙ™™ˆˆÏƒBˆ^İ[O^Üİ[\ËœİX›Z]•^O”™YÚ\İ˜\Õ^ƒBˆÕİXÚX›SÜXÚ]OƒBˆÕšY]ÏƒBˆÔØÜ›ÛšY]ÏƒBˆÒÙ^X›Ø\™]›ÚY[™ÕšY]ÏƒBˆ
+_CBƒBˆÙX[ÙßCBƒBˆÙØİ[Y[™]šY]È	‰ˆ
+BˆšY]Èİ[O^ÖÜİ[\Ë™Øİ[Y[™]šY]Ë[ÙHOOH˜Ø[Y\˜Hˆ	‰ˆİ[\Ë™Øİ[Y[™]šY]Óİ™\›^KØİ[Y[™]šY]Ë™\XØ]H	‰ˆİ[\Ë™Øİ[Y[™]šY]Ñ\XØ]W_OƒBˆšY]Èİ[O^Üİ[\Ë™Øİ[Y[™]šY]ÒXY\ŸOƒBˆ[ÛšXÛÛœÈ˜[YO^ÙØİ[Y[™]šY]Ë™\XØ]HÈ˜[\XÚ\˜ÛHˆˆ˜ÚXÚÛX\šËXÚ\˜ÛHŸHÚ^™O^ÌŒŸHÛÛÜ^ÙØİ[Y[™]šY]Ë™\XØ]HÈˆÑ‘ŒˆˆˆÌLÑÎLŸHÏƒBˆ^İ[O^Üİ[\Ë™Øİ[Y[™]šY]Õ]_OÙØİ[Y[™]šY]Ë™\XØ]HÈ‘Øİ[Y[ÈXH™YÚ\İ˜YÈˆˆØİ[Y[™]šY]Ë›\•˜[YÈOOH˜[ÙHÈ‘Øİ[Y[ÈpëYÈˆˆ”™YÚ\İ›È™X[^˜YÈŸOÕ^ƒBˆİXÚX›SÜXÚ]Hİ[O^Üİ[\Ëœ™]šY]ĞÛÜÙ_HÛ”™\ÜÏ^Ê
+HOˆÙ]Øİ[Y[™]šY]Ê[
+_HXØÙ\ÜÚXš[]SX™[HÙ\œ˜\ˆ]š\ÛÈ[ÛšXÛÛœÈ˜[YOH˜ÛÜÙHˆÚ^™O^ÌNHÛÛÜHˆÙ™™ˆˆÏÕİXÚX›SÜXÚ]OƒBˆÕšY]ÏƒBˆšY]Èİ[O^Üİ[\Ëœ™]šY]Ñ›Ûİ\ŸOšY]Èİ[O^ŞÈ›^ˆH_O^İ[O^Üİ[\Ë™Øİ[Y[™]šY]Õ˜[Y_O‘Øİ[Y[ÎˆÙØİ[Y[™]šY]Ë˜ÙY[_OÕ^ÈHYØİ[Y[™]šY]Ë˜˜\ÙTİ]\È	‰ˆ^İ[O^Üİ[\Ë™Øİ[Y[™]šY]Õ˜[Y_OÙØİ[Y[™]šY]Ë˜˜\ÙTİ]\ßOÕ^ŸOÕšY]ÏšY]Èİ[O^ÖÜİ[\Ëœ™]šY]Ğ˜YÙKØİ[Y[™]šY]Ë™\XØ]H	‰ˆİ[\Ëœ™]šY]Ğ˜YÙQ\XØ]W_O^İ[O^Üİ[\Ëœ™]šY]Ğ˜YÙU^OÙØİ[Y[™]šY]Ë™\XØ]HÈ‘TPĞQÈˆˆ‘ÕPT‘QÈŸOÕ^ÕšY]ÏÕšY]ÏƒBˆÕšY]ÏƒBˆ
+_CBƒBˆËÊˆ™XÚY[\È
+‹ßCBˆÛ[ÙHOOH˜Ø[Y\˜Hˆ	‰ˆšY]Èİ[O^Üİ[\Ëœ™XÙ[Ü˜\OƒBˆšY]Èİ[O^Üİ[\Ëœ™XÙ[XY\ŸOƒBˆ^İ[O^Üİ[\Ëœ™XÙ[]_O”™XÚY[\ÏÕ^ƒBˆ^İ[O^Üİ[\Ëœ™XÙ[Y]_OÙ\XØYÜĞ›Ü]YXYÜßH\XØYÜÈ›Ü]YXYÜÏÕ^ƒBˆÕšY]ÏƒBˆ›]\İBˆ]O^Ü™XÚY[\ßCBˆÙ^Q^˜XİÜ^Ê]
+HOˆ]šYCBˆÜš^›Û[BˆÚİÜÒÜš^›Û[ØÜ›Û[™XØ]Ü^Ù˜[Ù_CBˆÛÛ[ÛÛZ[™\”İ[O^ŞÈY[™ÒÜš^›Û[ˆM‹Ø\ˆ_CBˆ\İ[\PÛÛ\Û™[^Ï^İ[O^Üİ[\Ëœ™XÙ[[\_Opî›ˆ›È^H\ØØ[™[ÜËÕ^ŸCBˆ™[™\’][O^ÊÈ][HJHOˆ
+BˆšY]Èİ[O^Üİ[\Ëœ™XÙ[Ú\OƒBˆ^İ[O^Üİ[\Ëœ™XÙ[ÙY[_OÚ][K˜ÙY[_OÕ^ƒBˆ^İ[O^ÖÜİ[\Ëœ™XÙ[šY[È›ÛÚ^™NˆNK›ÛÙZYÚˆLˆW_O”™YÚ\İ˜YÏÕ^ƒBˆÈHZ][K››ÛXœ™H	‰ˆ^İ[O^Üİ[\Ëœ™XÙ[˜[Y_H[X™\“Ù“[™\Ï^Ì_OÚ][K››ÛXœ™_OÕ^ŸCBˆÈHZ][K˜Ø\™ÛÈ	‰ˆ^İ[O^Üİ[\Ëœ™XÙ[šY[H[X™\“Ù“[™\Ï^Ì_OÚ][K˜Ø\™ÛßOÕ^ŸCBˆÈHZ][K›][šXÚ\[È	‰ˆ^İ[O^Üİ[\Ëœ™XÙ[šY[H[X™\“Ù“[™\Ï^Ì_OÚ][K›][šXÚ\[ßOÕ^ŸCBˆÕšY]ÏƒBˆ
+_CBˆÏƒBˆÕšY]ÏŸCBƒBˆİØ\İ	‰ˆ
+BˆšY]ÃBˆ\İQHœØØ[‹]Ø\İƒBˆİ[O^ÖÃBˆİ[\ËØ\İBˆØ\İšÚ[™OOH›ÚÈˆ	‰ˆÈ˜XÚÙÜ›İ[™ÛÛÜˆ[YKœİXØÙ\ÜĞ™Ë›Ü™\ÛÛÜˆ[YKœİXØÙ\ÜÈKBˆØ\İšÚ[™OOH™\ˆ	‰ˆÈ˜XÚÙÜ›İ[™ÛÛÜˆ[YK™\œ›Ü™Ë›Ü™\ÛÛÜˆ[YK™\œ›ÜˆKBˆØ\İšÚ[™OOH™\œˆˆ	‰ˆÈ˜XÚÙÜ›İ[™ÛÛÜˆ[YKØ\›š[™Ğ™Ë›Ü™\ÛÛÜˆ[YKØ\›š[™ÈKBˆ_CBˆƒBˆ^İ[O^Üİ[\ËØ\İ^OİØ\İ^OÕ^ƒBˆÕšY]ÏƒBˆ
+_CBƒBˆÔØY™P\™XUšY]ÏƒBˆ
+NÃBŸCBƒB˜ÛÛœİİ[\ÈHİ[TÚY]˜Ü™X]JÃBˆXXÚ\Ø\™ˆÈX\™Ú[’Üš^›Û[ˆM‹X\™Ú[•™\XØ[ˆY[™ÎˆM‹›Ü™\”˜Y]\ÎˆM‹Ø\ˆHKBˆXXÚ\[œİÙ\ˆÈÛÛÜˆˆÙ™™ˆ‹›ÛÚ^™NˆÌ›ÛÙZYÚˆLˆKBˆXXÚ\‘]Z[ˆÈÛÛÜˆˆÙ™™ˆ‹›ÛÚ^™NˆMHKBˆXXÚ\“][šXÚ\[]NˆÈÛÛÜˆˆÙ™™ˆ‹›ÛÚ^™NˆŒ›ÛÙZYÚˆÌˆKBˆÛÛZ[™\ˆÈ›^ˆK˜XÚÙÜ›İ[™ÛÛÜˆ[YK˜™ÈKBˆØ[Y\˜PÛÛZ[™\ˆÈ˜XÚÙÜ›İ[™ÛÛÜˆˆÌLŒˆKBˆØ[Y\˜UÜ˜\ˆÈZ[’ZYÚˆ›^\™Xİ[Ûˆœ›İÈ‹[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆœÜXÙKX™]ÙY[ˆ‹Y[™ÒÜš^›Û[ˆM‹˜XÚÙÜ›İ[™ÛÛÜˆˆÌLMŒ‹›Ü™\›İÛUÚYˆK›Ü™\›İÛPÛÛÜˆˆÌŒÌÍˆˆKBˆØ[Y\˜RXY\]ÛˆÈZ[•ÚYˆZ[’ZYÚˆM[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆ˜Ù[\ˆ‹Ø\ˆHKBˆØ[Y\˜RXY\]Û“X™[ˆÈÛÛÜˆˆÑMŒˆ‹›ÛÚ^™NˆL›ÛÙZYÚˆˆKBˆØ[Y\˜RXY\•]NˆÈ›^ˆK[YÛ’][\Îˆ˜Ù[\ˆ‹Y[™ÒÜš^›Û[ˆKBˆØ[Y\˜Pœ˜[™ˆÈÛÛÜˆˆÙ™™ˆ‹›ÛÚ^™NˆMË›ÛÙZYÚˆLˆKBˆØ[Y\˜Q]™[˜[YNˆÈÛÛÜˆˆĞÎÑ‹›ÛÚ^™NˆLK›ÛÙZYÚˆÌ‹X\™Ú[•Üˆ‹X^ÚYˆŒL	HˆKBˆÜ˜\ˆÈ›^\™Xİ[Ûˆœ›İÈ‹Y[™ÒÜš^›Û[ˆMY[™ÕÜˆ‹Y[™Ğ›İÛNˆ[YÛ’][\Îˆ˜Ù[\ˆ‹Ø\ˆLKBˆ]™[]NˆÈÛÛÜˆ[YK^›ÛÚ^™NˆMË›ÛÙZYÚˆLˆKBˆİ]\Ô›İÎˆÈ›^\™Xİ[Ûˆœ›İÈ‹[YÛ’][\Îˆ˜Ù[\ˆ‹X\™Ú[•ÜˆKBˆİˆÈÚYˆZYÚˆ›Ü™\”˜Y]\ÎˆX\™Ú[”šYÚˆˆKBˆİ]\Õ^ˆÈ›ÛÙZYÚˆÌ‹›ÛÚ^™NˆLˆKBˆİ]\ÓY]NˆÈÛÛÜˆ[YK^\ØX›Y›ÛÚ^™NˆLHKBˆÜXİ[ÛœÎˆÈ›^\™Xİ[Ûˆœ›İÈ‹[YÛ’][\Îˆ˜Ù[\ˆ‹Ø\ˆKBˆİÚ]Ú]™[ˆÃBˆÚYˆBˆZYÚˆBˆ›Ü™\”˜Y]\ÎˆBˆ[YÛ’][\Îˆ˜Ù[\ˆ‹Bˆ\İYPÛÛ[ˆ˜Ù[\ˆ‹Bˆ˜XÚÙÜ›İ[™ÛÛÜˆ[YKœİ\™˜XÙKBˆ›Ü™\•ÚYˆKBˆ›Ü™\ÛÛÜˆ[YK˜›Ü™\‹BˆKBˆÛİ[\”[ˆÈZ[•ÚYˆ‹˜XÚÙÜ›İ[™ÛÛÜˆˆÌÑÌˆ‹›Ü™\•ÚYˆK›Ü™\ÛÛÜˆˆÌMĞM‹›Ü™\”˜Y]\ÎˆMY[™ÒÜš^›Û[ˆL‹Y[™Õ™\XØ[ˆË[YÛ’][\Îˆ˜Ù[\ˆ‹[]˜][ÛˆKBˆÛİ[\•˜[YNˆÈÛÛÜˆˆÙ™™ˆ‹›ÛÚ^™Nˆ[™RZYÚˆË›ÛÙZYÚˆL‹›Û˜\šX[ˆÈX[\‹[[\È—HKBˆÛİ[\“X™[ˆÈÛÛÜˆˆÑÑ‘‘‹›ÛÚ^™NˆK›ÛÙZYÚˆL‹^˜[œÙ›Ü›Nˆ\\˜Ø\ÙH‹]\”ÜXÚ[™ÎˆKBˆ[ÙT›İÎˆÈ›^\™Xİ[Ûˆœ›İÈ‹X\™Ú[’Üš^›Û[ˆMX\™Ú[›İÛNˆ˜XÚÙÜ›İ[™ÛÛÜˆ[YKœİ\™˜XÙK›Ü™\”˜Y]\ÎˆY[™ÎˆË›Ü™\•ÚYˆK›Ü™\ÛÛÜˆ[YK˜›Ü™\ˆKBˆ[ÙPˆÈ›^ˆK›^\™Xİ[Ûˆœ›İÈ‹[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆ˜Ù[\ˆ‹Y[™Õ™\XØ[ˆK›Ü™\”˜Y]\Îˆ‹Ø\ˆˆKBˆ[ÙPXİ]™NˆÈ˜XÚÙÜ›İ[™ÛÛÜˆ[YK˜œ˜[™KBˆ[ÙU^ˆÈÛÛÜˆ[YK^ÙXÛÛ™\K›ÛÙZYÚˆÌ‹›ÛÚ^™NˆLÈKBˆØ[Y\˜UÜ˜\ˆÈ›^ˆKX\™Ú[’Üš^›Û[ˆ›Ü™\”˜Y]\ÎˆNİ™\™›İÎˆšY[ˆ‹˜XÚÙÜ›İ[™ÛÛÜˆˆÌ‹›Ü™\•ÚYˆK›Ü™\ÛÛÜˆˆÌŒÌÍˆˆKBˆØ[TXÙZÛ\ˆÈ›^ˆK[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆ˜Ù[\ˆ‹Y[™ÎˆØ\ˆLˆKBˆ\›U]NˆÈÛÛÜˆ[YK^›ÛÚ^™NˆN›ÛÙZYÚˆˆKBˆ\›U^ˆÈÛÛÜˆ[YK^ÙXÛÛ™\K›ÛÚ^™NˆLË^[YÛˆ˜Ù[\ˆˆKBˆ™]XÛSİ™\›^NˆÈ‹‹P”ÓÓUWÑ’S[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆ˜Ù[\ˆ‹Y[™ÒÜš^›Û[ˆMˆKBˆ™]XÛNˆÈÚYˆŒL	H‹X^ÚYˆÌŒ\ÜXİ˜][ÎˆKN‹›Ü™\”˜Y]\Îˆİ™\™›İÎˆšY[ˆ‹˜XÚÙÜ›İ[™ÛÛÜˆœ™Ø˜JŒLŠHˆKBˆ˜XÚÔ™]XÛNˆÈ\İYPÛÛ[ˆœÜXÙKX™]ÙY[ˆ‹Y[™ÎˆMˆKBˆØØ[“[™NˆÈÜÚ][Ûˆ˜XœÛÛ]H‹ÜˆYˆšYÚˆZYÚˆË˜XÚÙÜ›İ[™ÛÛÜˆ[YK˜œ˜[™™[Û‹ÜXÚ]NˆMKÚYİĞÛÛÜˆ[YK˜œ˜[™™[Û‹ÚYİÓÜXÚ]NˆÚYİÓÙ™œÙ]ˆÈÚYˆZYÚˆKÚYİÔ˜Y]\Îˆ’[™^ˆÈKBˆ™]XÛPÛÜ›™\ˆÈÜÚ][Ûˆ˜XœÛÛ]H‹ÚYˆÎZYÚˆÎ›Ü™\ÛÛÜˆˆÑ‘‘‘‘‘ˆ‹’[™^ˆKBˆ™]XÛPÛÜ›™\•ÜYˆÈÜˆYˆ›Ü™\•ÜÚYˆË›Ü™\“YÚYˆÈKBˆ™]XÛPÛÜ›™\•ÜšYÚˆÈÜˆšYÚˆ›Ü™\•ÜÚYˆË›Ü™\”šYÚÚYˆÈKBˆ™]XÛPÛÜ›™\›İÛSYˆÈ›İÛNˆYˆ›Ü™\›İÛUÚYˆË›Ü™\“YÚYˆÈKBˆ™]XÛPÛÜ›™\›İÛTšYÚˆÈ›İÛNˆšYÚˆ›Ü™\›İÛUÚYˆË›Ü™\”šYÚÚYˆÈKBˆ\‘İZYNˆÈ[YÛ”Ù[ˆ™›^Y[™‹ÚYˆŒŒ‰H‹\ÜXİ˜][ÎˆK›Ü™\•ÚYˆ‹›Ü™\ÛÛÜˆˆÙ™™ˆ‹›Ü™\”˜Y]\Îˆ‹˜XÚÙÜ›İ[™ÛÛÜˆœ™Ø˜JMKMKMKŒ
+HˆKBˆ\‘İZYNˆÈØ\ˆHKBˆ\‘İZYS[™NˆÈZYÚˆ‹›Ü™\”˜Y]\ÎˆË˜XÚÙÜ›İ[™ÛÛÜˆœ™Ø˜JMKMKMKÍJHˆKBˆ™]XÛR[ˆÈÛÛÜˆˆÙ™™ˆ‹X\™Ú[•ÜˆL‹˜XÚÙÜ›İ[™ÛÛÜˆœ™Ø˜JŠH‹Y[™ÒÜš^›Û[ˆL‹Y[™Õ™\XØ[ˆ‹›Ü™\”˜Y]\Îˆ›ÛÚ^™NˆLˆKBˆËÈÙY\\È™[İÈØØ[ÙY[PØ[Y\˜IÜÈ]™Hİ]\È[ÛÈØØ[‹Ü™XY\ˆ\œ›ÜœÈİ^Hš\ÚX›KƒBˆØ[Y\˜R[œİXİ[ÛœÎˆÈÜÚ][Ûˆ˜XœÛÛ]H‹Üˆ‹YˆMšYÚˆMZ[’ZYÚˆŒ‹›^\™Xİ[Ûˆœ›İÈ‹[YÛ’][\Îˆ˜Ù[\ˆ‹Ø\ˆLY[™ÒÜš^›Û[ˆMY[™Õ™\XØ[ˆK›Ü™\”˜Y]\ÎˆM˜XÚÙÜ›İ[™ÛÛÜˆœ™Ø˜JŒÎMKL‹MŠH‹›Ü™\•ÚYˆ‹›Ü™\ÛÛÜˆˆÍMQLÑˆ‹[]˜][ÛˆKBˆØ[Y\˜R[œİXİ[ÛœÕ^ˆÈ›^ˆHKBˆØ[Y\˜R[œİXİ[ÛœÕ]NˆÈÛÛÜˆˆÌŒ‘H‹›ÛÚ^™NˆM[™RZYÚˆN›ÛÙZYÚˆLˆKBˆØ[Y\˜R[œİXİ[ÛœÑ]Z[ˆÈÛÛÜˆˆÌH‹›ÛÚ^™NˆL‹[™RZYÚˆM‹›ÛÙZYÚˆŒ‹X\™Ú[•ÜˆˆKBˆØ[Y\˜P›İÛPÛÛ›ÛÎˆÈÜÚ][Ûˆ˜XœÛÛ]H‹›İÛNˆL‹YˆMšYÚˆM›^\™Xİ[Ûˆœ›İÈ‹[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆœÜXÙKX™]ÙY[ˆ‹Z[’ZYÚˆL‹Y[™ÒÜš^›Û[ˆY[™Õ™\XØ[ˆË›Ü™\”˜Y]\ÎˆŒ˜XÚÙÜ›İ[™ÛÛÜˆœ™Ø˜JMKN
+H‹›Ü™\•ÚYˆK›Ü™\ÛÛÜˆœ™Ø˜JMKMKMKŒŠHˆKBˆØ[Y\˜TÚYPÛÛ›ÛˆÈÚYˆÍ‹Z[’ZYÚˆ[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆ˜Ù[\ˆ‹Ø\ˆÈKBˆØ[Y\˜T™XYÛÛ›ÛˆÈ[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆ˜Ù[\ˆ‹Ø\ˆÈKBˆØ[Y\˜PÛÛ›ÛX™[ˆÈÛÛÜˆˆÙ™™ˆ‹›ÛÚ^™NˆL‹[™RZYÚˆM‹›ÛÙZYÚˆLˆKBˆØ[Y\˜PÛİ[\˜YÙNˆÈZ[•ÚYˆLŒ‹Z[’ZYÚˆÍ‹Y[™ÒÜš^›Û[ˆL‹Y[™Õ™\XØ[ˆ‹›Ü™\”˜Y]\ÎˆM‹[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆ˜Ù[\ˆ‹˜XÚÙÜ›İ[™ÛÛÜˆˆÌL‘MQ‹›Ü™\•ÚYˆK›Ü™\ÛÛÜˆˆÌÎN‘‘ˆ‹[]˜][ÛˆˆKBˆØ[Y\˜PÛİ[\•˜[YNˆÈÛÛÜˆˆÙ™™ˆ‹›ÛÚ^™NˆÍ[™RZYÚˆÎ›ÛÙZYÚˆL‹›Û˜\šX[ˆÈX[\‹[[\È—HKBˆØ[Y\˜PÛİ[\“X™[ˆÈÛÛÜˆˆÑL‘‘H‹›ÛÚ^™NˆL[™RZYÚˆM›ÛÙZYÚˆL‹]\”ÜXÚ[™ÎˆHKBˆÚ]\]ÛˆÈÚYˆZYÚˆ›Ü™\”˜Y]\ÎˆÌ‹˜XÚÙÜ›İ[™ÛÛÜˆˆÙ™™ˆ‹[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆ˜Ù[\ˆ‹›Ü™\•ÚYˆ›Ü™\ÛÛÜˆ[YK˜œ˜[™KBˆØ\\™PˆÃBˆ›^\™Xİ[Ûˆœ›İÈ‹Bˆ[YÛ’][\Îˆ˜Ù[\ˆ‹BˆØ\ˆBˆ˜XÚÙÜ›İ[™ÛÛÜˆ[YK˜œ˜[™BˆY[™ÒÜš^›Û[ˆBˆY[™Õ™\XØ[ˆMBˆ›Ü™\”˜Y]\ÎˆBˆÚYİĞÛÛÜˆ[YK˜œ˜[™BˆÚYİÓÜXÚ]NˆKBˆÚYİÓÙ™œÙ]ˆÈÚYˆZYÚˆKBˆÚYİÔ˜Y]\ÎˆL‹Bˆ[]˜][Ûˆ‹BˆKBˆØ\\™P•^ˆÈÛÛÜˆˆÙ™™ˆ‹›ÛÙZYÚˆ‹›ÛÚ^™NˆMHKBˆX[X[ØÜ›ÛˆÈY[™ÎˆM‹Y[™Ğ›İÛNˆKBˆX[X[Ø\™ˆÈ˜XÚÙÜ›İ[™ÛÛÜˆ[YKœİ\™˜XÙK›Ü™\”˜Y]\ÎˆY[™ÎˆM‹›Ü™\•ÚYˆK›Ü™\ÛÛÜˆ[YK˜›Ü™\‹Ø\ˆKBˆX[X[X™[ˆÈÛÛÜˆ[YK^ÙXÛÛ™\K›ÛÚ^™NˆLK›ÛÙZYÚˆÌ‹]\”ÜXÚ[™ÎˆKŒ‹^˜[œÙ›Ü›Nˆ\\˜Ø\ÙH‹X\™Ú[•ÜˆLKBˆX[X[[œ]ˆÈ˜XÚÙÜ›İ[™ÛÛÜˆ[YK˜™Ë›Ü™\•ÚYˆK›Ü™\ÛÛÜˆ[YK˜›Ü™\‹›Ü™\”˜Y]\ÎˆY[™ÒÜš^›Û[ˆMY[™Õ™\XØ[ˆM‹ÛÛÜˆ[YK^›ÛÚ^™NˆMHKBˆ™]šY]ÕÜ˜\ˆÈX\™Ú[•ÜˆL‹Y[™ÎˆL‹›Ü™\•ÚYˆK›Ü™\ÛÛÜˆ[YK˜›Ü™\‹›Ü™\”˜Y]\ÎˆØ\ˆKBˆ™]šY]Õ]NˆÈ›ÛÚ^™NˆL‹›ÛÙZYÚˆL‹]\”ÜXÚ[™ÎˆKŒ‹^˜[œÙ›Ü›Nˆ\\˜Ø\ÙHˆKBˆ™]šY]Ó˜[YNˆÈÛÛÜˆ[YK^›ÛÙZYÚˆ‹›ÛÚ^™NˆM‹X\™Ú[•ÜˆKBˆ™]šY]ÓY]NˆÈÛÛÜˆ[YK^ÙXÛÛ™\K›ÛÚ^™NˆLÈKBˆİX›Z]ˆÈ›^\™Xİ[Ûˆœ›İÈ‹\İYPÛÛ[ˆ˜Ù[\ˆ‹[YÛ’][\Îˆ˜Ù[\ˆ‹Ø\ˆ˜XÚÙÜ›İ[™ÛÛÜˆ[YK˜œ˜[™Y[™Õ™\XØ[ˆM‹›Ü™\”˜Y]\ÎˆX\™Ú[•ÜˆMˆKBˆİX›Z]•^ˆÈÛÛÜˆˆÙ™™ˆ‹›ÛÙZYÚˆ‹›ÛÚ^™NˆMˆKBˆØİ[Y[™]šY]ÎˆÈX\™Ú[’Üš^›Û[ˆMX\™Ú[•ÜˆLY[™ÎˆL‹˜XÚÙÜ›İ[™ÛÛÜˆ[YKœİ\™˜XÙK›Ü™\•ÚYˆK›Ü™\ÛÛÜˆ[YK˜›Ü™\‹›Ü™\”˜Y]\ÎˆØ\ˆKBˆØİ[Y[™]šY]Óİ™\›^NˆÈÜÚ][Ûˆ˜XœÛÛ]H‹YˆMšYÚˆM›İÛNˆM‹X\™Ú[’Üš^›Û[ˆX\™Ú[•Üˆ’[™^ˆML˜XÚÙÜ›İ[™ÛÛÜˆœ™Ø˜JL‹M‹NLŠH‹›Ü™\ÛÛÜˆœ™Ø˜JMKMKMKŒŠH‹›Ü™\”˜Y]\ÎˆMY[™ÎˆMKÚYİĞÛÛÜˆˆÌ‹ÚYİÓÜXÚ]NˆŒÌ‹ÚYİÔ˜Y]\ÎˆL‹[]˜][ÛˆKBˆØİ[Y[™]šY]Ñ\XØ]NˆÈ›Ü™\ÛÛÜˆœ™Ø˜JMKM‹ÍËŒÍJHˆKBˆØİ[Y[™]šY]ÒXY\ˆÈ›^\™Xİ[Ûˆœ›İÈ‹[YÛ’][\Îˆ˜Ù[\ˆ‹Ø\ˆKBˆØİ[Y[™]šY]Õ]NˆÈ›^ˆKÛÛÜˆˆÙ™™ˆ‹›ÛÙZYÚˆ‹›ÛÚ^™NˆLÈKBˆ™]šY]ĞÛÜÙNˆÈÚYˆKZYÚˆK[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆ˜Ù[\ˆˆKBˆ™]šY]Ñ›Ûİ\ˆÈ›^\™Xİ[Ûˆœ›İÈ‹[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆœÜXÙKX™]ÙY[ˆ‹Ø\ˆLX\™Ú[•ÜˆKBˆ™]šY]Ğ˜YÙNˆÈ˜XÚÙÜ›İ[™ÛÛÜˆˆÌÑNH‹›Ü™\”˜Y]\ÎˆNNKY[™ÒÜš^›Û[ˆLY[™Õ™\XØ[ˆHKBˆ™]šY]Ğ˜YÙQ\XØ]NˆÈ˜XÚÙÜ›İ[™ÛÛÜˆˆÎŒ‘ŒˆˆKBˆ™]šY]Ğ˜YÙU^ˆÈÛÛÜˆˆÙ™™ˆ‹›ÛÚ^™NˆK›ÛÙZYÚˆL‹]\”ÜXÚ[™ÎˆŒÈKBˆØİ[Y[™]šY]ÔÛİ\˜ÙNˆÈX\™Ú[“Yˆ˜]]È‹ÛÛÜˆ[YK^\ØX›Y›ÛÙZYÚˆÌ‹›ÛÚ^™NˆLHKBˆØİ[Y[™]šY]ÑÜšYˆÈ›^\™Xİ[Ûˆœ›İÈ‹Ø\ˆKBˆØİ[Y[™]šY]ĞÙ[ˆÈ›^ˆK˜XÚÙÜ›İ[™ÛÛÜˆ[YK˜™Ë›Ü™\”˜Y]\ÎˆY[™ÒÜš^›Û[ˆLY[™Õ™\XØ[ˆKBˆØİ[Y[™]šY]ÓX™[ˆÈÛÛÜˆ[YK^\ØX›Y›ÛÚ^™NˆL›ÛÙZYÚˆ‹^˜[œÙ›Ü›Nˆ\\˜Ø\ÙH‹]\”ÜXÚ[™ÎˆHKBˆØİ[Y[™]šY]Õ˜[YNˆÈÛÛÜˆˆÙ™™ˆ‹›ÛÚ^™NˆL‹›ÛÙZYÚˆÌ‹X\™Ú[•ÜˆˆKBˆØİ[Y[™]šY]Ó˜[YNˆÈÛÛÜˆ[YK^ÙXÛÛ™\K›ÛÚ^™NˆLË›ÛÙZYÚˆÌˆKBˆØİ[Y[™]šY]ÓY]NˆÈÛÛÜˆ[YK^\ØX›Y›ÛÚ^™NˆLHKBˆ™XÙ[Ü˜\ˆÈY[™ÕÜˆL‹Y[™Ğ›İÛNˆ›Ü™\•ÜÚYˆK›Ü™\ÛÛÜˆ[YK˜›Ü™\‹˜XÚÙÜ›İ[™ÛÛÜˆ[YK˜™ÈKBˆ™XÙ[XY\ˆÈ›^\™Xİ[Ûˆœ›İÈ‹\İYPÛÛ[ˆœÜXÙKX™]ÙY[ˆ‹Y[™ÒÜš^›Û[ˆŒX\™Ú[›İÛNˆKBˆ™XÙ[]NˆÈÛÛÜˆ[YK^›ÛÙZYÚˆ‹›ÛÚ^™NˆLË^˜[œÙ›Ü›Nˆ\\˜Ø\ÙH‹]\”ÜXÚ[™ÎˆHKBˆ™XÙ[Y]NˆÈÛÛÜˆ[YK™\œ›Ü‹›ÛÚ^™NˆLK›ÛÙZYÚˆÌˆKBˆ™XÙ[[\NˆÈÛÛÜˆ[YK^\ØX›Y›ÛÚ^™NˆL‹Y[™ÒÜš^›Û[ˆMˆKBˆ™XÙ[Ú\ˆÈ˜XÚÙÜ›İ[™ÛÛÜˆ[YKœİ\™˜XÙK›Ü™\”˜Y]\ÎˆY[™ÒÜš^›Û[ˆL‹Y[™Õ™\XØ[ˆ›Ü™\•ÚYˆK›Ü™\ÛÛÜˆ[YK˜›Ü™\‹Z[•ÚYˆMX^ÚYˆŒŒKBˆ™XÙ[ÙY[NˆÈÛÛÜˆ[YK^›ÛÙZYÚˆ‹›ÛÚ^™NˆMKBˆ™XÙ[˜[YNˆÈÛÛÜˆ[YK^ÙXÛÛ™\K›ÛÚ^™NˆLKX\™Ú[•ÜˆˆKBˆ™XÙ[šY[ˆÈÛÛÜˆ[YK^\ØX›Y›ÛÚ^™NˆLX\™Ú[•ÜˆHKBˆØ\İˆÈÜÚ][Ûˆ˜XœÛÛ]H‹ÜˆYˆŒšYÚˆŒY[™ÎˆM›Ü™\”˜Y]\ÎˆM›Ü™\•ÚYˆK’[™^ˆŒKBˆØ\İ^ˆÈÛÛÜˆ[YK^›ÛÙZYÚˆ‹›ÛÚ^™NˆM^[YÛˆ˜Ù[\ˆˆKBˆ[\UÜ˜\ˆÈ›^ˆK[YÛ’][\Îˆ˜Ù[\ˆ‹\İYPÛÛ[ˆ˜Ù[\ˆ‹Y[™ÎˆÌ‹Ø\ˆLˆKBˆ[\U]NˆÈÛÛÜˆ[YK^›ÛÚ^™NˆŒ›ÛÙZYÚˆˆKBˆ[\TİXˆÈÛÛÜˆ[YK^ÙXÛÛ™\K^[YÛˆ˜Ù[\ˆˆKBˆš[X\PˆÈ˜XÚÙÜ›İ[™ÛÛÜˆ[YK˜œ˜[™Y[™ÒÜš^›Û[ˆŒY[™Õ™\XØ[ˆL‹›Ü™\”˜Y]\ÎˆL‹X\™Ú[•ÜˆLˆKBˆš[X\P•^ˆÈÛÛÜˆˆÙ™™ˆ‹›ÛÙZYÚˆ‹›ÛÚ^™NˆMHKBŸJNÃB

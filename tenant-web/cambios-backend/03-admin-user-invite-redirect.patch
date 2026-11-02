@@ -1,0 +1,42 @@
+--- a/functions/admin-user-invite/index.ts
++++ b/functions/admin-user-invite/index.ts
+@@ -2,6 +2,14 @@
+ 
+ const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type" };
+ 
++// Orígenes del portal permitidos para los enlaces (secret PORTAL_ORIGINS="https://portal.ejemplo.com,https://otro.netlify.app").
++const allowedOrigins = (Deno.env.get("PORTAL_ORIGINS") || "").split(",").map((v) => v.trim()).filter(Boolean);
++const FALLBACK_REDIRECT = Deno.env.get("DEFAULT_PORTAL_URL") || "https://jmservicetec.com/accept-invite.html";
++function safeRedirect(value: unknown): string {
++  try { const u = new URL(String(value || "")); if (allowedOrigins.includes(u.origin)) return u.origin + u.pathname; } catch { /* usa el valor por defecto */ }
++  return FALLBACK_REDIRECT;
++}
++
+ Deno.serve(async (req) => {
+   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+   try {
+@@ -19,13 +27,11 @@
+     const email = String(body.email || "").trim().toLowerCase();
+     const fullName = String(body.full_name || "").trim().slice(0, 120);
+     const role = body.role === "admin" ? "admin" : "operator";
+-    const redirectTo = String(body.redirect_to || "").trim();
++    const redirectTo = safeRedirect(body.redirect_to);
+     if (!email || !email.includes("@")) throw new Error("Correo inválido");
+     const admin = createClient(url, service);
+     const inviteOptions: { data: { full_name: string }; redirectTo?: string } = { data: { full_name: fullName } };
+-    if (redirectTo && (redirectTo.startsWith("https://") || redirectTo.startsWith("http://localhost") || redirectTo.startsWith("jmservicetec://"))) {
+-      inviteOptions.redirectTo = redirectTo;
+-    }
++    inviteOptions.redirectTo = redirectTo; // validado contra PORTAL_ORIGINS; nunca un destino arbitrario
+     let data: any;
+     let error: any;
+     ({ data, error } = await admin.auth.admin.inviteUserByEmail(email, inviteOptions));
+@@ -43,7 +49,7 @@
+       const { data: existingProfile } = await admin.from("profiles").select("tenant_id").eq("id", existing.id).maybeSingle();
+       if (!existingProfile || existingProfile.tenant_id !== profile.tenant_id) throw new Error("Ese correo ya pertenece a otra empresa");
+       if (existing.email_confirmed_at) {
+-        const recovery = await admin.auth.resetPasswordForEmail(email, { redirectTo: redirectTo || "https://jmservicetec.com/accept-invite.html" });
++        const recovery = await admin.auth.resetPasswordForEmail(email, { redirectTo });
+         if (recovery.error) throw recovery.error;
+         return new Response(JSON.stringify({ ok: true, id: existing.id, email, mode: "recovery" }), { headers: { ...cors, "Content-Type": "application/json" } });
+       }

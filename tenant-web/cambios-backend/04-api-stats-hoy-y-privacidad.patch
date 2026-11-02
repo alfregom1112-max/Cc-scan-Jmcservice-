@@ -1,0 +1,22 @@
+--- a/src/server.js
++++ b/src/server.js
+@@ -193,13 +193,16 @@
+ }));
+ app.get("/v1/events/:eventId/stats", { preHandler: [authenticate, activeMembership, authorizeEvent] }, async (request) => {
+   const scope = { tenant_id: request.actor.tenant_id, event_id: request.event.id };
+-  const dayStart = new Date(); dayStart.setUTCHours(5, 0, 0, 0);
++  // Medianoche de Colombia (UTC-5, sin horario de verano) del día actual en Colombia.
++  const bogotaNow = new Date(Date.now() - 5 * 3600000);
++  const dayStart = new Date(Date.UTC(bogotaNow.getUTCFullYear(), bogotaNow.getUTCMonth(), bogotaNow.getUTCDate(), 5, 0, 0, 0));
+   const [total, today, recent] = await Promise.all([
+     scans.countDocuments(scope),
+     scans.countDocuments({ ...scope, captured_at: { $gte: dayStart } }),
+-    scans.find(scope).sort({ received_at: -1 }).limit(8).toArray(),
++    // Un operador no debe recibir documentos ni nombres de otros operadores.
++    request.actor.role === "admin" ? scans.find(scope).sort({ received_at: -1 }).limit(8).toArray() : Promise.resolve([]),
+   ]);
+-  return { total, hoy: today, duplicados_detectados: 0, dispositivos_usados: new Set(recent.map((x) => x.device_id).filter(Boolean)).size, dispositivos_activos: 0,
++  return { total, hoy: today, duplicados_detectados: null, dispositivos_usados: request.actor.role === "admin" ? new Set(recent.map((x) => x.device_id).filter(Boolean)).size : null, dispositivos_activos: null,
+     recientes: recent.map((x) => ({ id: x.id, cedula: decryptField(x.document_number_enc), nombre: decryptField(x.display_name_enc), created_at: x.received_at })) };
+ });
+ app.get("/v1/admin/metrics", { preHandler: [authenticate, activeMembership, verifyAdmin] }, async (request) => {

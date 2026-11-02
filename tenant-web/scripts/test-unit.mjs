@@ -1,0 +1,15 @@
+import assert from "node:assert/strict";
+import { toCsv, neutralizeCell } from "../src/lib/csv.js";
+import { membershipActive, fmtIso, maskDoc, slugify } from "../src/lib/format.js";
+let n = 0; const t = (name, fn) => { fn(); n++; console.log("✓", name); };
+t("CSV neutraliza fórmulas", () => { for (const v of ["=1+1", "+SUM(A1)", "-2", "@cmd", "\tx", "\rx"]) assert.equal(neutralizeCell(v), `'${v}`); assert.equal(neutralizeCell("normal"), "normal"); });
+t("CSV escapa comillas, usa CRLF y BOM", () => { const c = toCsv(["a"], [['di"jo'], ["=HYPERLINK(1)"]]); assert.ok(c.startsWith("﻿")); assert.ok(c.includes('"di""jo"')); assert.ok(c.includes("\"'=HYPERLINK(1)\"")); assert.ok(c.includes("\r\n")); });
+t("Membresía igual que RLS/API", () => { const f = new Date(Date.now() + 864e5).toISOString(), p = new Date(Date.now() - 864e5).toISOString();
+  assert.equal(membershipActive({ subscription_status: "internal" }), true);
+  assert.equal(membershipActive({ subscription_status: "active", current_period_ends_at: f }), true);
+  assert.equal(membershipActive({ subscription_status: "trial", current_period_ends_at: f }), true);
+  assert.equal(membershipActive({ subscription_status: "active", current_period_ends_at: p }), false);
+  assert.equal(membershipActive({ subscription_status: "suspended", current_period_ends_at: f }), false);
+  assert.equal(membershipActive({ subscription_status: "active" }), false); assert.equal(membershipActive(null), false); });
+t("Formatos", () => { assert.equal(maskDoc("1234567890"), "••••••7890"); assert.equal(slugify("Asamblea Ñandú 2026!"), "asamblea-nandu-2026"); assert.match(fmtIso(Date.UTC(2026, 0, 1, 5, 0, 0)), /^2026-01-01 00:00:00$/); });
+console.log(`${n} pruebas OK`);

@@ -18,4 +18,6 @@ frontend/ios/Pods/
 
 # generated tenant-web config
 tenant-web/dist/config.js
+tenant-web/dist-demo/
+tenant-web/.npm-cache/
 backend/.npm-cache/
