@@ -61,14 +61,38 @@ async function authenticate(request, reply) {
   const { data: profile, error } = await supabase.from("profiles")
     .select("id,email,full_name,role,status,tenant_id,is_platform_admin")
     .eq("id", user.id).maybeSingle();
-  if (error || !profile || profile.status !== "active" || !profile.tenant_id) return reply.code(403).send({ error: "La cuenta está inactiva o no tiene empresa asignada" });
-  const { data: tenant } = await supabase.from("tenants")
+  if (error) {
+    request.log.error({ code: error.code }, "Supabase profile lookup failed for an authenticated request");
+    return reply.code(503).send({ error: "No se pudo verificar tu perfil. Intenta de nuevo en unos minutos." });
+  }
+  if (!profile) return reply.code(403).send({ error: "No se encontró el perfil de esta cuenta en Supabase." });
+  if (profile.status !== "active") return reply.code(403).send({ error: "Esta cuenta está desactivada en Supabase. Pide al superadministrador que la reactive." });
+
+  // Platform admins are not customer tenants. If their internal tenant link is
+  // missing, resolve the existing JM ServiceTec tenant without changing data.
+  let tenantId = profile.tenant_id;
+  if (!tenantId && profile.is_platform_admin) {
+    const { data: internalTenant, error: internalTenantError } = await supabase.from("tenants")
+      .select("id").eq("slug", "jm-servicetec").maybeSingle();
+    if (internalTenantError) {
+      request.log.error({ code: internalTenantError.code }, "Supabase internal tenant lookup failed");
+      return reply.code(503).send({ error: "No se pudo consultar la empresa interna JM ServiceTec." });
+    }
+    tenantId = internalTenant?.id || null;
+  }
+  if (!tenantId) return reply.code(403).send({ error: "Este perfil no tiene empresa asignada. Un superadministrador debe asignarla." });
+
+  const { data: tenant, error: tenantError } = await supabase.from("tenants")
     .select("id,name,subscription_status,current_period_ends_at,billing_period")
-    .eq("id", profile.tenant_id).maybeSingle();
-  if (!tenant) return reply.code(403).send({ error: "La empresa no está activa" });
+    .eq("id", tenantId).maybeSingle();
+  if (tenantError) {
+    request.log.error({ code: tenantError.code }, "Supabase tenant lookup failed for an authenticated request");
+    return reply.code(503).send({ error: "No se pudo verificar la empresa asignada en Supabase." });
+  }
+  if (!tenant) return reply.code(403).send({ error: "La empresa asignada no existe o no está disponible." });
   const active = tenant.subscription_status === "internal" ||
     (["active", "trial"].includes(tenant.subscription_status) && tenant.current_period_ends_at && new Date(tenant.current_period_ends_at) > new Date());
-  request.actor = { id: profile.id, email: profile.email, name: profile.full_name, role: profile.role, tenant_id: profile.tenant_id, is_platform_admin: Boolean(profile.is_platform_admin), tenant, membership_active: Boolean(active) };
+  request.actor = { id: profile.id, email: profile.email, name: profile.full_name, role: profile.role, tenant_id: tenantId, is_platform_admin: Boolean(profile.is_platform_admin), tenant, membership_active: Boolean(profile.is_platform_admin || active) };
 }
 async function activeMembership(request, reply) {
   if (!request.actor?.membership_active) return reply.code(402).send({ error: "La membresía está vencida o inactiva" });
