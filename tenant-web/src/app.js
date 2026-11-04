@@ -11,6 +11,8 @@ import { renderSetPassword } from "./views/set-password.js";
 import { renderBlocked } from "./views/blocked.js";
 import { renderPlatformDashboard } from "./views/platform-dashboard.js";
 import { renderCompanies } from "./views/companies.js";
+import { renderTrash } from "./views/trash.js";
+import { renderSales } from "./views/sales.js";
 import { renderDashboard } from "./views/dashboard.js";
 import { renderEvents } from "./views/events.js";
 import { renderEventDetail } from "./views/event-detail.js";
@@ -33,6 +35,8 @@ const OPS = ["superadmin", "admin"];
 const ROUTES = {
   platform: { roles: ["superadmin"], view: renderPlatformDashboard },
   companies: { roles: ["superadmin"], view: renderCompanies },
+  sales: { roles: ["superadmin"], view: renderSales },
+  trash: { roles: OPS, view: renderTrash },
   dashboard: { roles: OPS, view: renderDashboard },
   events: { roles: OPS, view: (c, env) => (env.params[0] ? renderEventDetail(c, env) : renderEvents(c, env)) },
   users: { roles: OPS, view: renderUsers },
@@ -43,12 +47,12 @@ const ROUTES = {
 };
 const NAV = {
   superadmin: [
-    { group: "Plataforma", items: [{ to: "platform", label: "Resumen", icon: "chart" }, { to: "companies", label: "Empresas", icon: "building" }] },
-    { group: "Operación interna", items: [{ to: "dashboard", label: "Panel", icon: "dashboard" }, { to: "events", label: "Eventos", icon: "calendar" }, { to: "users", label: "Usuarios", icon: "users" }, { to: "assignments", label: "Asignaciones", icon: "link" }, { to: "reports", label: "Reportes", icon: "report" }] },
+    { group: "Plataforma", items: [{ to: "platform", label: "Resumen", icon: "chart" }, { to: "companies", label: "Empresas", icon: "building" }, { to: "sales", label: "Ventas y pagos", icon: "report" }] },
+    { group: "Operación interna", items: [{ to: "dashboard", label: "Panel", icon: "dashboard" }, { to: "events", label: "Eventos", icon: "calendar" }, { to: "users", label: "Usuarios", icon: "users" }, { to: "assignments", label: "Asignaciones", icon: "link" }, { to: "reports", label: "Reportes", icon: "report" }, { to: "trash", label: "Papelera", icon: "trash" }] },
     { group: "Cuenta", items: [{ to: "profile", label: "Mi perfil", icon: "user" }] },
   ],
   admin: [
-    { group: "Empresa", items: [{ to: "dashboard", label: "Panel", icon: "dashboard" }, { to: "events", label: "Eventos", icon: "calendar" }, { to: "users", label: "Usuarios", icon: "users" }, { to: "assignments", label: "Asignaciones", icon: "link" }, { to: "reports", label: "Reportes", icon: "report" }] },
+    { group: "Empresa", items: [{ to: "dashboard", label: "Panel", icon: "dashboard" }, { to: "events", label: "Eventos", icon: "calendar" }, { to: "users", label: "Usuarios", icon: "users" }, { to: "assignments", label: "Asignaciones", icon: "link" }, { to: "reports", label: "Reportes", icon: "report" }, { to: "trash", label: "Papelera", icon: "trash" }] },
     { group: "Cuenta", items: [{ to: "profile", label: "Mi perfil", icon: "user" }] },
   ],
   operator: [{ group: "Trabajo", items: [{ to: "my-events", label: "Mis eventos", icon: "calendar" }, { to: "profile", label: "Mi perfil", icon: "user" }] }],
@@ -67,6 +71,7 @@ function showPublic() {
   state.ctx = null; state.shell = null;
   document.title = "Acceso · JM ServiceTec Eventos";
   const { section } = parseHash();
+  if (!section && !callbackErrorMessage()) { location.replace("planes.html"); return; }
   if (section === "activar") renderActivate(root, { onBack: () => go("#/") });
   else renderLogin(root, { callbackError: callbackErrorMessage(), onActivate: () => go("#/activar") });
 }
@@ -153,7 +158,7 @@ async function route() {
   const { main, setOpen } = state.shell;
   const ctx = state.ctx; const role = roleOf(ctx);
   const { section, params, query } = parseHash();
-  if (!section) { go(HOME[role]); return; }
+  if (!section || ["acceso", "login", "portal"].includes(section)) { go(HOME[role]); return; }
   setOpen(false);
   state.shell.cleanup?.(); state.shell.cleanup = null;
   for (const a of state.shell.sidebar.querySelectorAll(".nav-link")) { const on = a.dataset.to === section; a.classList.toggle("is-active", on); on ? a.setAttribute("aria-current", "page") : a.removeAttribute("aria-current"); }

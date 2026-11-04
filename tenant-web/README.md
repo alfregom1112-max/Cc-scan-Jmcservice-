@@ -36,7 +36,7 @@ Membresía vencida/inactiva: los admins y operadores ven una pantalla explicativ
 - **Router/sesión**: recuperación de sesión, callback de invitación/recuperación, errores de enlace caducado y navegación sin recargas por refresco de token.
 - **Usuarios**: solo `active`/`inactive`; «suspendida» es de la membresía.
 - **Estadísticas**: `/stats` se rotula «todo el evento»; «mis registros» sale de `/count`; el operador nunca ve `recientes` de otros.
-- **KPIs**: duplicados y dispositivos activos (la API devuelve `0` fijo) y tendencia/top operadores (vacíos) se declaran *no disponibles*. «Dispositivos usados» se rotula aproximado (últimos 8). «Hoy» se marca no disponible entre 19:00 y 24:00 (Colombia) por un error real del cálculo de día en la API. Reportes calcula registros por hora y por operador en el navegador sobre los datos cargados, y lo dice.
+- **KPIs**: duplicados y dispositivos activos se muestran como *no disponibles* porque la API todavía no los mide; tendencia/top operadores también se calculan en Reportes sobre los datos cargados. «Dispositivos usados» se rotula aproximado (últimos 8). «Hoy» se calcula desde las 00:00 de Colombia y ya está disponible durante todo el día.
 - **Reportes/CSV**: descarga todas las páginas (500 c/u, tope 50 000), progreso, cancelar, filtros, error parcial visible y archivo marcado `-PARCIAL`; neutralización de fórmulas (`= + - @ TAB CR`).
 - **Activación por PIN** integrada en el portal (`#/activar`); `activate-pin.html` redirige.
 

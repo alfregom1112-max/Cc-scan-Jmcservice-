@@ -42,5 +42,5 @@ This debug APK is for direct installation and internal testing. Before publishin
 4. Sign in with an operator and confirm that only the operator's jornada, scanner, history, and profile are available.
 5. Scan a test document and verify the result and server sync.
 
-Web portal: https://coruscating-truffle-13663a.netlify.app/
+Web portal: https://ccscanjmcservice.netlify.app/
 API health endpoint: https://jm-servicetec-api.onrender.com/v1/health

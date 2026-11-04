@@ -4,3 +4,7 @@ project_id = "sjmjgfimnwvepghoqjgh"
 # la función y nunca se expone la service-role key a la aplicación móvil.
 [functions.activate-user-pin]
 verify_jwt = false
+
+# Wompi debe poder entregar webhooks sin JWT de Supabase.
+[functions.public-commerce]
+verify_jwt = false

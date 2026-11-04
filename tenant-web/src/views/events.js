@@ -1,4 +1,4 @@
-import { el, btn, card, pageHeader, dataTable, pager, emptyState, errorState, pill, field, input, textarea, select, formMessage, setMessage, withBusy, openDialog, toast, debounce } from "../lib/ui.js";
+import { confirmDialog, el, btn, card, pageHeader, dataTable, pager, emptyState, errorState, pill, field, input, textarea, select, formMessage, setMessage, withBusy, openDialog, toast, debounce } from "../lib/ui.js";
 import { repo } from "../lib/repo.js";
 import { EVENT_STATUS, fmtDateTime, fmtNumber, toLocalInput, relativeDays } from "../lib/format.js";
 
@@ -45,6 +45,10 @@ export function renderEvents(container, { ctx, query, go }) {
     host,
   );
 
+  async function trash(e) {
+    if (!(await confirmDialog({title:"Enviar evento a la papelera",message:"Se detiene el escaneo de este evento. Su asistencia y cupo consumido se conservan. Puedes restaurarlo después.",confirmLabel:"Enviar a papelera",danger:true}))) return;
+    try { await repo.trash.move("events",e.id); await load(); } catch(err) { toast(err.message,"danger"); }
+  }
   async function load() {
     const id = ++loadId;
     host.replaceChildren(card(dataTable({ columns: [{ label: "Evento" }, { label: "Inicio" }, { label: "Estado" }, { label: "Registros" }, { label: "" }], rows: [], loading: true }), { cls: "card-flush" }));
@@ -66,7 +70,7 @@ export function renderEvents(container, { ctx, query, go }) {
           { label: "Inicio", render: (e) => el("div", { class: "cell-stack" }, [fmtDateTime(e.starts_at), el("span", { class: "muted small" }, relativeDays(e.starts_at))]) },
           { label: "Estado", render: (e) => pill(EVENT_STATUS[e.status]?.label || e.status, EVENT_STATUS[e.status]?.tone || "neutral") },
           { label: "Registros", class: "num", render: (e) => (counts ? fmtNumber(counts[e.id] ?? 0) : el("span", { class: "muted", title: "La API de asistencia no respondió" }, "—")) },
-          { label: "", class: "col-actions", render: (e) => btn({ label: "Abrir", small: true, href: `#/events/${e.id}` }) },
+          { label: "", class: "col-actions", render: (e) => el("div", {class:"row-actions"}, [btn({ label: "Abrir", small: true, href: `#/events/${e.id}` }),btn({label:"Papelera",icon:"trash",small:true,onClick:()=>trash(e)})]) },
         ],
         rows,
         empty: filtered ? emptyState({ icon: "search", title: "Ningún evento coincide", text: "Prueba con otra búsqueda o quita el filtro de estado." }) : emptyState({ icon: "calendar", title: "Aún no hay eventos", text: "Crea el primero para asignar operadores y registrar asistencia.", action: btn({ label: "Nuevo evento", icon: "plus", variant: "primary", onClick: () => newBtn.click() }) }),

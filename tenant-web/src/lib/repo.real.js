@@ -61,6 +61,11 @@ const normScan = (s) => ({
 
 export const realRepo = {
   mode: "real",
+  trash: {
+    async list() { return must(await getClient().from("recycle_bin").select("entity_type,entity_id,label,deleted_at").order("deleted_at", {ascending:false}).limit(1000)); },
+    async move(type,id) { return must(await getClient().rpc("recycle_item",{p_type:type,p_id:id,p_restore:false})); },
+    async restore(type,id) { return must(await getClient().rpc("recycle_item",{p_type:type,p_id:id,p_restore:true})); },
+  },
 
   auth: {
     async init() { await getClient().auth.getSession(); }, // espera a que se procese el enlace de retorno
@@ -86,22 +91,24 @@ export const realRepo = {
   /** profiles (propio) + tenants (propio; el superadmin lee todos). */
   async loadContext(userId) {
     const c = getClient();
-    const { data: profile, error } = await c.from("profiles").select("id,email,full_name,role,status,tenant_id,is_platform_admin").eq("id", userId).maybeSingle();
+    const { data: profile, error } = await c.from("profiles").select("id,email,full_name,role,status,tenant_id,is_platform_admin").is("deleted_at", null).eq("id", userId).maybeSingle();
     if (error || !profile) throw new Error("No se pudo cargar tu perfil.");
     if (profile.status !== "active") throw new Error("Tu cuenta está inactiva. Contacta al administrador de tu empresa.");
-    const { data: tenant } = await c.from("tenants").select("id,name,slug,subscription_status,current_period_ends_at,billing_period").eq("id", profile.tenant_id).maybeSingle();
+    const { data: tenant, error: tenantError } = await c.from("tenants").select("id,name,slug,billing_mode,subscription_status,current_period_ends_at,billing_period,subscription_plan_id,subscription_event_limit,subscription_operator_limit,subscription_events_used").is("deleted_at", null).eq("id", profile.tenant_id).maybeSingle();
+    if (tenantError) throw new Error("No se pudo consultar la membresía de tu empresa. Actualiza e inténtalo de nuevo.");
     return { profile, tenant };
   },
 
   tenants: {
-    async list() { return must(await getClient().from("tenants").select("id,name,slug,billing_period,subscription_status,price_cop,current_period_starts_at,current_period_ends_at,created_at").order("created_at", { ascending: false }).limit(1000), "No se pudieron cargar las empresas."); },
-    create: ({ name, ownerEmail, billingPeriod, priceCop }) => invoke("platform-tenant-create", { name, owner_email: ownerEmail, billing_period: billingPeriod, price_cop: priceCop }),
-    update: (tenantId, action) => invoke("platform-tenant-update", { tenant_id: tenantId, action }),
+    async list() { return must(await getClient().from("tenants").select("id,name,slug,billing_mode,billing_period,subscription_status,price_cop,current_period_starts_at,current_period_ends_at,subscription_plan_id,subscription_event_limit,subscription_operator_limit,subscription_events_used,created_at").is("deleted_at", null).order("created_at", { ascending: false }).limit(1000), "No se pudieron cargar las empresas."); },
+    async plans() { return must(await getClient().from("subscription_plan_catalog").select("id,billing_period,operators_limit,included_events,price_cop").eq("active", true).order("operators_limit"), "No se pudieron cargar los planes de membresía."); },
+    create: ({ name, ownerEmail, billingMode, planId }) => invoke("platform-tenant-create", { name, owner_email: ownerEmail, billing_mode: billingMode, ...(planId ? { plan_id: planId } : {}) }),
+    update: (tenantId, action, extra = {}) => invoke("platform-tenant-update", { tenant_id: tenantId, action, ...extra }),
   },
 
   events: {
     async list({ search = "", status = "", offset = 0, limit = 20 }) {
-      let q = getClient().from("events").select("id,name,starts_at,place,description,status,created_at", { count: "exact" }).order("starts_at", { ascending: false }).range(offset, offset + limit - 1);
+      let q = getClient().from("events").select("id,name,starts_at,place,description,status,created_at", { count: "exact" }).is("deleted_at", null).order("starts_at", { ascending: false }).range(offset, offset + limit - 1);
       if (status) q = q.eq("status", status);
       const term = safeTerm(search);
       if (term) q = q.or(`name.ilike.%${term}%,place.ilike.%${term}%`);
@@ -111,15 +118,15 @@ export const realRepo = {
     },
     async statusCounts() {
       const c = getClient();
-      const res = await Promise.all(["active", "inactive", "closed"].map((s) => c.from("events").select("id", { count: "exact", head: true }).eq("status", s)));
+      const res = await Promise.all(["active", "inactive", "closed"].map((s) => c.from("events").select("id", { count: "exact", head: true }).is("deleted_at", null).eq("status", s)));
       if (res.some((r) => r.error)) throw new Error("No se pudieron contar los eventos.");
       return { active: res[0].count || 0, inactive: res[1].count || 0, closed: res[2].count || 0 };
     },
     async upcoming(limit = 5) {
-      return must(await getClient().from("events").select("id,name,starts_at,place,status").eq("status", "active").gte("starts_at", new Date().toISOString()).order("starts_at", { ascending: true }).limit(limit), "No se pudieron cargar los próximos eventos.");
+      return must(await getClient().from("events").select("id,name,starts_at,place,status").is("deleted_at", null).eq("status", "active").gte("starts_at", new Date().toISOString()).order("starts_at", { ascending: true }).limit(limit), "No se pudieron cargar los próximos eventos.");
     },
-    async options() { return must(await getClient().from("events").select("id,name,status,starts_at").order("starts_at", { ascending: false }).limit(500), "No se pudieron cargar los eventos."); },
-    async get(id) { const { data, error } = await getClient().from("events").select("id,name,starts_at,place,description,status,created_at,created_by").eq("id", id).maybeSingle(); if (error) throw new Error("No se pudo cargar el evento."); return data; },
+    async options() { return must(await getClient().from("events").select("id,name,status,starts_at").is("deleted_at", null).order("starts_at", { ascending: false }).limit(500), "No se pudieron cargar los eventos."); },
+    async get(id) { const { data, error } = await getClient().from("events").select("id,name,starts_at,place,description,status,created_at,created_by").is("deleted_at", null).eq("id", id).maybeSingle(); if (error) throw new Error("No se pudo cargar el evento."); return data; },
     async create(values, userId) { return must(await getClient().from("events").insert({ ...values, created_by: userId, status: "active" }).select("id").single(), "No se pudo crear el evento."); },
     async update(id, patch) { return must(await getClient().from("events").update(patch).eq("id", id).select("id").single(), "No se pudo guardar el evento."); },
     /** DELETE /v1/events/:id → archiva (status=closed) y registra auditoría; conserva los registros. */
@@ -170,8 +177,8 @@ export const realRepo = {
   async globalMetrics() { const m = await api("/v1/admin/metrics"); return { events: m.global?.eventos ?? 0, activeEvents: m.global?.eventos_activos ?? 0, scans: m.global?.registros ?? 0 }; },
 
   users: {
-    async list() { return must(await getClient().from("profiles").select("id,email,full_name,role,status,created_at").order("created_at", { ascending: false }).limit(1000), "No se pudieron cargar los usuarios."); },
-    async operators() { return must(await getClient().from("profiles").select("id,email,full_name,status").eq("role", "operator").order("full_name").limit(1000), "No se pudieron cargar los operadores."); },
+    async list() { return must(await getClient().from("profiles").select("id,email,full_name,role,status,created_at").is("deleted_at", null).order("created_at", { ascending: false }).limit(1000), "No se pudieron cargar los usuarios."); },
+    async operators() { return must(await getClient().from("profiles").select("id,email,full_name,status").is("deleted_at", null).eq("role", "operator").order("full_name").limit(1000), "No se pudieron cargar los operadores."); },
     invite: ({ email, fullName, role }) => invoke("admin-user-invite", { email, full_name: fullName, role, redirect_to: `${location.origin}${location.pathname}` }),
     resend: (email) => invoke("admin-user-resend", { email }),
     setStatus: (userId, status) => invoke("admin-user-status", { user_id: userId, status, action: "status" }),

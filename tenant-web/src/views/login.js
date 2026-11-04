@@ -46,6 +46,7 @@ export function renderLogin(root, { callbackError, onActivate }) {
       el("div", { class: "auth-links" }, [
         el("button", { class: "link-btn", type: "button", onClick: () => swap("recover") }, "Recuperar acceso"),
         el("button", { class: "link-btn", type: "button", onClick: onActivate }, "Tengo un PIN de activación"),
+        el("a", { class: "link-btn", href: "planes.html" }, "Ver planes y aplicación propia"),
       ]),
     ]);
     return el("div", {}, [el("h1", { class: "auth-title" }, "Inicia sesión"), el("p", { class: "auth-lead" }, "Usa la cuenta que te dio tu administrador."), f]);

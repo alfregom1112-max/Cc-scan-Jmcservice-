@@ -3,8 +3,8 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const cors = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type", "Access-Control-Allow-Methods": "POST, OPTIONS" };
 
 // Orígenes del portal permitidos para los enlaces (secret PORTAL_ORIGINS="https://portal.ejemplo.com,https://otro.netlify.app").
-const allowedOrigins = (Deno.env.get("PORTAL_ORIGINS") || "https://coruscating-truffle-13663a.netlify.app").split(",").map((v) => v.trim()).filter(Boolean);
-const FALLBACK_REDIRECT = Deno.env.get("DEFAULT_PORTAL_URL") || "https://coruscating-truffle-13663a.netlify.app/";
+const allowedOrigins = (Deno.env.get("PORTAL_ORIGINS") || "https://ccscanjmcservice.netlify.app").split(",").map((v) => v.trim()).filter(Boolean);
+const FALLBACK_REDIRECT = Deno.env.get("DEFAULT_PORTAL_URL") || "https://ccscanjmcservice.netlify.app/";
 function safeRedirect(value: unknown): string {
   try { const u = new URL(String(value || "")); if (allowedOrigins.includes(u.origin)) return u.origin + u.pathname; } catch { /* usa el valor por defecto */ }
   return FALLBACK_REDIRECT;

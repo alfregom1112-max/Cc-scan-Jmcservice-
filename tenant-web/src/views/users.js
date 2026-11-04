@@ -48,8 +48,8 @@ export function renderUsers(container, { ctx }) {
     try { await repo.users.setStatus(u.id, next); toast("Usuario actualizado", "ok"); await load(true); } catch (e) { toast(e.message, "danger"); }
   }
   async function remove(u) {
-    if (!(await confirmDialog({ title: "Eliminar usuario", message: `Se elimina la cuenta de ${u.full_name || u.email} y sus asignaciones. No se puede deshacer. Para conservar el acceso bloqueado, mejor desactívala.`, confirmLabel: "Eliminar cuenta", danger: true, requireText: "ELIMINAR" }))) return;
-    try { await repo.users.remove(u.id); toast("Usuario eliminado", "ok"); await load(true); } catch (e) { toast(e.message, "danger"); }
+    if (!(await confirmDialog({title:"Enviar usuario a la papelera",message:`Se bloqueará el acceso de ${u.full_name || u.email}. Su historial se conserva y podrás restaurarlo.`,confirmLabel:"Enviar a papelera",danger:true}))) return;
+    try { await repo.trash.move("profiles",u.id); toast("Usuario enviado a papelera","ok"); await load(true); } catch(e) { toast(e.message,"danger"); }
   }
   function paint() {
     const q = search.value.trim().toLowerCase();
@@ -64,7 +64,7 @@ export function renderUsers(container, { ctx }) {
           { label: "Estado", render: (u) => pill(USTATUS[u.status]?.label || u.status, USTATUS[u.status]?.tone || "neutral") },
           { label: "Eventos asignados", class: "num", render: (u) => (u.role === "operator" ? el("a", { class: "link", href: `#/assignments/${u.id}` }, String(assignCount[u.id] ?? 0)) : el("span", { class: "muted" }, "No aplica")) },
           { label: "Alta", render: (u) => fmtDate(u.created_at) },
-          { label: "", class: "col-actions", render: (u) => (u.id === ctx.profile.id ? el("span", { class: "muted small" }, "Tu cuenta") : menuButton({ label: `Acciones para ${u.full_name || u.email}`, items: [{ label: "Reenviar invitación", icon: "mail", onClick: () => resend(u) }, u.role === "operator" ? { label: "Ver asignaciones", icon: "link", onClick: () => { location.hash = `#/assignments/${u.id}`; } } : null, { label: u.status === "active" ? "Desactivar" : "Activar", icon: u.status === "active" ? "ban" : "check", onClick: () => toggle(u) }, { label: "Eliminar cuenta", icon: "trash", danger: true, onClick: () => remove(u) }] })) },
+          { label: "", class: "col-actions", render: (u) => (u.id === ctx.profile.id ? el("span", { class: "muted small" }, "Tu cuenta") : menuButton({ label: `Acciones para ${u.full_name || u.email}`, items: [{ label: "Reenviar invitación", icon: "mail", onClick: () => resend(u) }, u.role === "operator" ? { label: "Ver asignaciones", icon: "link", onClick: () => { location.hash = `#/assignments/${u.id}`; } } : null, { label: u.status === "active" ? "Desactivar" : "Activar", icon: u.status === "active" ? "ban" : "check", onClick: () => toggle(u) }, { label: "Enviar a papelera", icon: "trash", danger: true, onClick: () => remove(u) }] })) },
         ],
         rows: slice,
         empty: users.length ? emptyState({ icon: "search", title: "Nadie coincide", text: "Cambia la búsqueda o el filtro de rol." }) : emptyState({ icon: "users", title: "Aún no hay usuarios", text: "Invita a tu equipo por correo o genera un PIN para operadores.", action: btn({ label: "Invitar usuario", variant: "primary", icon: "mail", onClick: openInvite }) }),

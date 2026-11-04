@@ -12,12 +12,12 @@ if (!demo && (!process.env.SUPABASE_URL || !process.env.SUPABASE_PUBLISHABLE_KEY
 }
 await rm(dist, { recursive: true, force: true });
 await mkdir(path.join(dist, "fonts"), { recursive: true });
-for (const file of ["index.html", "activate-pin.html", "styles.css", "favicon.svg"]) await cp(path.join(root, "src", file), path.join(dist, file));
+for (const file of ["index.html", "activate-pin.html", "styles.css", "favicon.svg", "planes.html", "planes.css", "escaneo.js", "acuerdo.js", "acuerdo-entrega.html"]) await cp(path.join(root, "src", file), path.join(dist, file));
 const fontDir = path.join(root, "node_modules/@fontsource-variable/schibsted-grotesk/files");
 for (const f of ["schibsted-grotesk-latin-wght-normal.woff2", "schibsted-grotesk-latin-ext-wght-normal.woff2"]) await cp(path.join(fontDir, f), path.join(dist, "fonts", f));
 
 await build({
-  entryPoints: [path.join(root, "src", "app.js")],
+  entryPoints: [path.join(root, "src", "app.js"), path.join(root, "src", "planes.js")],
   bundle: true, minify: true, format: "esm", target: "es2022", outdir: dist, legalComments: "none",
   define: { __JM_DEMO__: demo ? "true" : "false" },
 });

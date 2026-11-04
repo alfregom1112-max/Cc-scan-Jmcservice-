@@ -77,7 +77,8 @@ export const ROLE_LABEL = { superadmin: "Superadministrador", admin: "Administra
 /** Misma regla que el backend (authenticate) y la RLS (tenant_subscription_active). */
 export function membershipActive(tenant) {
   if (!tenant) return false;
-  if (tenant.subscription_status === "internal") return true;
+  if (tenant.billing_mode === "internal" || tenant.subscription_status === "internal") return true;
+  if (["per_event", "lifetime"].includes(tenant.billing_mode)) return !["suspended", "cancelled"].includes(tenant.subscription_status);
   return ["active", "trial"].includes(tenant.subscription_status) && Boolean(tenant.current_period_ends_at) && new Date(tenant.current_period_ends_at) > new Date();
 }
 
